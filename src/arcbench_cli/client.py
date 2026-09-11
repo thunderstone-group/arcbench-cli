@@ -9,6 +9,7 @@ ARC-Bench deployment:
     GET  /api/requirements/{task_id}/tests?catalog=competition
     POST /api/submissions
     POST /api/runs
+    POST /api/runs/{id}/start
     GET  /api/runs/{id}
 
 Credentials are read from a local env file and are never written to output
@@ -21,12 +22,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,8 @@ DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_TIMEOUT = 60
 DEFAULT_MAX_SUBMISSIONS = 4
 DEFAULT_MIN_INTERVAL = 30.0
+DEFAULT_QUEUE_TIMEOUT = 3600.0
+DEFAULT_RETRY_AFTER = 30.0
 
 TERMINAL_STATES = {
     "PASSED",
@@ -201,6 +206,43 @@ def unwrap(payload: Any, key: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {"response": payload}
 
 
+def parse_retry_after(
+    headers: dict[str, str] | None,
+    default: float = DEFAULT_RETRY_AFTER,
+) -> float:
+    """Return a non-negative wait duration from a Retry-After header."""
+    if not headers:
+        return default
+    value = headers.get("retry-after")
+    if value is None:
+        return default
+    value = str(value).strip()
+    if not value:
+        return default
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None:
+        return default
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+
+
+def queue_wait_seconds(attempt: int, retry_after: float) -> float:
+    """Add a small deterministic backoff and a small random jitter."""
+    attempt = max(1, int(attempt))
+    base = max(0.0, float(retry_after))
+    backoff = base * (1.0 + min(attempt - 1, 5) * 0.1)
+    jitter = random.uniform(0.0, min(3.0, base * 0.1))
+    return max(0.0, backoff + jitter)
+
+
 @dataclass
 class SubmitConfig:
     base_url: str = DEFAULT_BASE_URL
@@ -211,6 +253,7 @@ class SubmitConfig:
     max_submissions: int = DEFAULT_MAX_SUBMISSIONS
     min_interval_seconds: float = DEFAULT_MIN_INTERVAL
     timeout_seconds: int = DEFAULT_TIMEOUT
+    queue_timeout_seconds: float = DEFAULT_QUEUE_TIMEOUT
 
     @classmethod
     def from_env(cls, env: dict[str, str]) -> "SubmitConfig":
@@ -225,12 +268,63 @@ class SubmitConfig:
                 env.get("ARC_BENCH_MIN_INTERVAL_SECONDS", DEFAULT_MIN_INTERVAL)
             ),
             timeout_seconds=int(env.get("ARC_BENCH_HTTP_TIMEOUT_SECONDS", DEFAULT_TIMEOUT)),
+            queue_timeout_seconds=float(
+                env.get("ARC_BENCH_QUEUE_TIMEOUT_SECONDS", DEFAULT_QUEUE_TIMEOUT)
+            ),
         )
+
+
+class RunStartError(RuntimeError):
+    """A single /start attempt returned an unsuccessful status."""
+
+    def __init__(
+        self,
+        run_id: str,
+        status: int,
+        payload: Any,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.run_id = run_id
+        self.status = status
+        self.payload = payload
+        self.headers = headers or {}
+        super().__init__(f"run {run_id} start failed ({status}): {payload}")
+
+
+class RunQueueTimeoutError(RuntimeError):
+    """The run stayed behind the platform capacity gate until timeout."""
+
+    def __init__(
+        self,
+        run_id: str,
+        timeout_seconds: float,
+        attempts: int,
+        last_status: str,
+        last_payload: Any,
+    ) -> None:
+        self.run_id = run_id
+        self.timeout_seconds = timeout_seconds
+        self.attempts = attempts
+        self.last_status = last_status
+        self.last_payload = last_payload
+        detail = f"last_status={last_status}"
+        if last_payload is not None:
+            detail += f" last_response={json.dumps(last_payload, ensure_ascii=False)[:300]}"
+        super().__init__(
+            f"run {run_id} did not start within {timeout_seconds:.0f}s "
+            f"({attempts} attempts, {detail}); recover with "
+            f"`arcbench start --run-id {run_id}`"
+        )
+
+
+def _normalize_headers(headers: Any) -> dict[str, str]:
+    return {str(key).lower(): str(value) for key, value in headers.items()}
 
 
 class OfficialClient:
     def __init__(self, config: SubmitConfig):
         self.config = config
+        self.last_response_headers: dict[str, str] = {}
 
     def _request(
         self,
@@ -250,12 +344,14 @@ class OfficialClient:
             request.add_header("Content-Type", content_type)
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                self.last_response_headers = _normalize_headers(response.headers)
                 body = response.read()
                 try:
                     return response.status, json.loads(body.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     return response.status, body.decode("utf-8", "replace")[:2000]
         except urllib.error.HTTPError as error:
+            self.last_response_headers = _normalize_headers(error.headers)
             raw = error.read().decode("utf-8", "replace")
             try:
                 return error.code, json.loads(raw)
@@ -371,18 +467,79 @@ class OfficialClient:
                 "run creation response had no id: "
                 + json.dumps(run, ensure_ascii=False)[:300]
             )
-        # Creating a run only persists it as PENDING. The platform's separate
-        # start endpoint performs the concurrency check and writes the outbox
-        # message that actually queues the Runner.
-        return self.start_run(str(run_id))
+        # Creating a run only persists it as PENDING. Starting is intentionally
+        # a separate call so a 429 queue wait can retry the same run id without
+        # creating another submission or run.
+        return run
 
     def start_run(self, run_id: str) -> dict[str, Any]:
         status, payload = self._request(
             "POST", f"{self.config.base_url}/api/runs/{run_id}/start"
         )
         if not 200 <= status < 300:
-            raise RuntimeError(f"run start failed ({status}): {payload}")
+            raise RunStartError(
+                str(run_id),
+                status,
+                payload,
+                self.last_response_headers,
+            )
         return unwrap(payload, "run")
+
+    def _queue_last_status(self, run_id: str, error: RunStartError) -> str:
+        try:
+            run = self.get_run(run_id)
+            status = run.get("status") if isinstance(run, dict) else None
+            if status:
+                return str(status)
+        except Exception:
+            pass
+        if isinstance(error.payload, dict) and error.payload.get("status"):
+            return str(error.payload["status"])
+        return "PENDING"
+
+    def start_run_with_queue_wait(
+        self,
+        run_id: str,
+        timeout_seconds: float = DEFAULT_QUEUE_TIMEOUT,
+        on_wait=None,
+    ) -> dict[str, Any]:
+        """Start one run, retrying only HTTP 429 capacity rejections."""
+        timeout_seconds = float(timeout_seconds)
+        deadline = time.monotonic() + timeout_seconds
+        attempts = 0
+
+        while True:
+            attempts += 1
+            try:
+                return self.start_run(run_id)
+            except RunStartError as error:
+                if error.status != 429:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RunQueueTimeoutError(
+                        run_id,
+                        timeout_seconds,
+                        attempts,
+                        self._queue_last_status(run_id, error),
+                        error.payload,
+                    ) from error
+
+                retry_after = parse_retry_after(error.headers)
+                delay = queue_wait_seconds(attempts, retry_after)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RunQueueTimeoutError(
+                        run_id,
+                        timeout_seconds,
+                        attempts,
+                        self._queue_last_status(run_id, error),
+                        error.payload,
+                    ) from error
+                if delay > remaining:
+                    delay = remaining
+                if on_wait:
+                    on_wait(attempts, retry_after, delay, error.status, error.payload)
+                time.sleep(delay)
 
     def poll_run(
         self,

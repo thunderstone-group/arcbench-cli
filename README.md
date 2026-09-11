@@ -57,6 +57,7 @@ ARC_BENCH_API_KEY=
 ARC_BENCH_MODEL=deepseek-v4-flash
 ARC_BENCH_MAX_SUBMISSIONS=4
 ARC_BENCH_MIN_INTERVAL_SECONDS=30
+ARC_BENCH_QUEUE_TIMEOUT_SECONDS=3600
 ```
 
 `ARC_BENCH_API_KEY` 是 Runner 调模型网关用的 key，不是 ARC-Bench 登录 Cookie。两者都不得提交或回显。
@@ -76,6 +77,7 @@ arcbench <command> [options]
 | `arcbench fetch` | `--competition <id>` | 下载公开测试包到 `./testsets/official/<competition>/` |
 | `arcbench package` | `--lab-root <path>` | 打包 Harness ZIP，并输出大小和 SHA-256 |
 | `arcbench submit` | ZIP、竞赛、任务、模型、名称 | 创建提交与运行，轮询进度，写 JSON 结果记录 |
+| `arcbench start` | `--run-id <id>` | 启动已有 PENDING run，等待官方队列槽位 |
 | `arcbench status` | 无 `--run-id` 时列最近运行；有则读取一次 | 输出状态和 `(通过率, Token, 时间)` |
 | `arcbench logs` | `--run-id <id>` | 保存原始日志，并抽取 `REQUIREMENTS-BEGIN/END` 内容 |
 | `arcbench replay` | 归档应用或 manifest、测试集 | 调用 lab 的 `scripts/replay.py` 重放 |
@@ -124,6 +126,26 @@ arcbench submit \
   --model deepseek-v4-flash
 ```
 
+平台并发槽位满时会返回 HTTP 429。CLI 会保留这次已经创建的
+submission/run，并只重试同一个 `run_id` 的 `/start`，直到成功或
+`--queue-timeout` 到期。设置更短或更长的等待窗口：
+
+```bash
+arcbench submit \
+  --package dist/pi-harness-agent.zip \
+  --competition smoke \
+  --task smoke--counter \
+  --queue-timeout 1800
+```
+
+如果等待超时，run 仍会留在 `PENDING` 状态。可以稍后直接恢复，不会重复创建
+submission/run：
+
+```bash
+arcbench start --run-id <run-id> --queue-timeout 3600
+arcbench status --run-id <run-id> --wait
+```
+
 只启动、不在当前进程等待：
 
 ```bash
@@ -159,11 +181,16 @@ CLI 内置三道本地保护：
 
 这些保护只作用于本机，不能协调队友从浏览器或另一台机器提交。多人共用账号时，仍需要一个外部约定或真正的共享排队器。
 
+`--queue-timeout` 等待的是“本次提交后，官方允许这个 run 占用队列槽位”，不是
+全局团队排队机。CLI 不会排队创建多个 submission/run；浏览器上的手动提交仍可能
+先于或晚于它拿到槽位。
+
 CLI 只做比赛允许的 Harness 提交和结果读取，不修改测试、计量器、系统时间或评分逻辑。
 
 平台创建 run 和启动 run 是两个调用：`POST /api/runs` 先创建 `PENDING` 记录，
-`POST /api/runs/{run_id}/start` 才会进入调度队列。CLI 会把两步连起来，
-避免出现“提交成功但永远 PENDING”的假状态。
+`POST /api/runs/{run_id}/start` 才会进入调度队列。CLI 会在 `POST /api/runs`
+成功一次后，反复重试同一个 `run_id` 的 `/start`。只有 HTTP 429 会进入等待
+和重试；409、404、权限错误等会立即停止，不会重新创建 submission/run。
 
 ## 环境变量
 
@@ -176,6 +203,7 @@ CLI 只做比赛允许的 Harness 提交和结果读取，不修改测试、计�
 | `ARC_BENCH_MODEL` | `deepseek-v4-flash` | 提交时记录的模型名 |
 | `ARC_BENCH_MAX_SUBMISSIONS` | `4` | 本机记录目录内的提交上限 |
 | `ARC_BENCH_MIN_INTERVAL_SECONDS` | `30` | 两次真实提交的最小间隔 |
+| `ARC_BENCH_QUEUE_TIMEOUT_SECONDS` | `3600` | 等待官方队列槽位的最长秒数 |
 | `ARC_BENCH_HTTP_TIMEOUT_SECONDS` | `60` | HTTP 超时 |
 | `ARC_BENCH_RECORD_DIR` | `./.arcbench/runs/submissions` | 结果 JSON 目录 |
 | `ARCBENCH_LAB_ROOT` | 自动探测 | `package`/`replay` 使用的 lab 路径 |
@@ -199,6 +227,8 @@ duration_seconds, run_url
 ```
 
 `sanitize()` 会在落盘前把 key、token、cookie、secret、password 等字段替换为 `***`。
+运行指标里的 `tokens`、`token_count`、`total_tokens` 等字段不属于凭据，会原样
+写入 JSON，不会被脱敏。
 
 ## 开发与测试
 

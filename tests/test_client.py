@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -9,12 +10,16 @@ from unittest.mock import patch
 
 from arcbench_cli.client import (
     OfficialClient,
+    RunQueueTimeoutError,
+    RunStartError,
     SubmitConfig,
     build_multipart,
     load_env,
+    parse_retry_after,
     sanitize,
     summarize_run,
     validate_package,
+    write_record,
 )
 
 
@@ -72,6 +77,21 @@ class ClientTests(unittest.TestCase):
             },
         )
 
+    def test_write_record_keeps_token_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.json"
+            write_record(
+                path,
+                {
+                    "api_key": "secret",
+                    "metrics": {"tokens": 123, "token_count": 123},
+                },
+            )
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["api_key"], "***")
+            self.assertEqual(saved["metrics"]["tokens"], 123)
+            self.assertEqual(saved["metrics"]["token_count"], 123)
+
     def test_summarize_run_keeps_metric_triple(self) -> None:
         metrics = summarize_run(
             {
@@ -93,8 +113,9 @@ class ClientTests(unittest.TestCase):
         config = SubmitConfig.from_env({})
         self.assertEqual(config.max_submissions, 4)
         self.assertEqual(config.min_interval_seconds, 30.0)
+        self.assertEqual(config.queue_timeout_seconds, 3600.0)
 
-    def test_create_run_starts_pending_run(self) -> None:
+    def test_create_run_only_persists_pending_run(self) -> None:
         class FakeClient(OfficialClient):
             def __init__(self) -> None:
                 super().__init__(SubmitConfig())
@@ -104,20 +125,86 @@ class ClientTests(unittest.TestCase):
                 self.calls.append((method, url))
                 if url.endswith("/api/runs"):
                     return 200, {"run": {"id": "run-1", "status": "PENDING"}}
-                if url.endswith("/api/runs/run-1/start"):
-                    return 200, {"id": "run-1", "status": "QUEUED"}
                 raise AssertionError(url)
 
         client = FakeClient()
         run = client.create_run("submission-1", "smoke--counter")
-        self.assertEqual(run["status"], "QUEUED")
+        self.assertEqual(run["status"], "PENDING")
         self.assertEqual(
             client.calls,
-            [
-                ("POST", "https://arc-bench.com/api/runs"),
-                ("POST", "https://arc-bench.com/api/runs/run-1/start"),
-            ],
+            [("POST", "https://arc-bench.com/api/runs")],
         )
+
+
+class QueueWaitTests(unittest.TestCase):
+    def test_retries_429_then_succeeds(self) -> None:
+        class FakeClient(OfficialClient):
+            def __init__(self) -> None:
+                super().__init__(SubmitConfig())
+                self.start_attempts = 0
+
+            def start_run(self, run_id: str) -> dict[str, object]:
+                self.start_attempts += 1
+                if self.start_attempts < 3:
+                    raise RunStartError(
+                        run_id,
+                        429,
+                        {"detail": "capacity full"},
+                        {"retry-after": "0"},
+                    )
+                return {"id": run_id, "status": "QUEUED"}
+
+        client = FakeClient()
+        with patch("arcbench_cli.client.time.sleep"):
+            run = client.start_run_with_queue_wait("run-1", timeout_seconds=5)
+        self.assertEqual(client.start_attempts, 3)
+        self.assertEqual(run["status"], "QUEUED")
+
+    def test_parse_retry_after_seconds_and_default(self) -> None:
+        self.assertEqual(parse_retry_after({"retry-after": "45"}), 45.0)
+        self.assertEqual(parse_retry_after({"retry-after": "0"}), 0.0)
+        self.assertEqual(parse_retry_after({}), 30.0)
+        self.assertEqual(parse_retry_after({"retry-after": "soon"}), 30.0)
+
+    def test_timeout_reports_run_id_and_recovery(self) -> None:
+        class FakeClient(OfficialClient):
+            def __init__(self) -> None:
+                super().__init__(SubmitConfig())
+                self.start_attempts = 0
+
+            def start_run(self, run_id: str) -> dict[str, object]:
+                self.start_attempts += 1
+                raise RunStartError(
+                    run_id,
+                    429,
+                    {"detail": "capacity full"},
+                    {"retry-after": "30"},
+                )
+
+            def get_run(self, run_id: str) -> dict[str, str]:
+                return {"id": run_id, "status": "PENDING"}
+
+        client = FakeClient()
+        with self.assertRaisesRegex(RunQueueTimeoutError, "arcbench start --run-id run-1"):
+            client.start_run_with_queue_wait("run-1", timeout_seconds=0)
+        self.assertEqual(client.start_attempts, 1)
+
+    def test_non_429_is_not_retried(self) -> None:
+        class FakeClient(OfficialClient):
+            def __init__(self) -> None:
+                super().__init__(SubmitConfig())
+                self.start_attempts = 0
+
+            def start_run(self, run_id: str) -> dict[str, object]:
+                self.start_attempts += 1
+                raise RunStartError(run_id, 409, {"detail": "already started"})
+
+        client = FakeClient()
+        with patch("arcbench_cli.client.time.sleep") as sleep:
+            with self.assertRaises(RunStartError):
+                client.start_run_with_queue_wait("run-1", timeout_seconds=5)
+        self.assertEqual(client.start_attempts, 1)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

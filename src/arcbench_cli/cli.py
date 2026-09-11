@@ -68,6 +68,16 @@ def _default_record_dir(env: dict[str, str]) -> Path:
     return (Path.cwd() / ".arcbench" / "runs" / "submissions").resolve()
 
 
+def _queue_timeout(args: argparse.Namespace, config: SubmitConfig) -> float:
+    timeout = getattr(args, "queue_timeout", None)
+    if timeout is None:
+        timeout = config.queue_timeout_seconds
+    timeout = float(timeout)
+    if timeout < 0:
+        raise CliError("--queue-timeout must be non-negative")
+    return timeout
+
+
 def _find_lab_root(explicit: str | None = None) -> Path | None:
     candidates: list[Path] = []
     if explicit:
@@ -371,6 +381,27 @@ def cmd_submit(args: argparse.Namespace) -> int:
             "run response had no id: "
             + json.dumps(run, ensure_ascii=False)[:300]
         )
+    log(f"run created: {run_id}  status={run.get('status', 'PENDING')}")
+
+    queue_timeout = _queue_timeout(args, config)
+
+    def on_queue_wait(
+        attempt: int,
+        retry_after: float,
+        delay: float,
+        status: int,
+        payload: Any,
+    ) -> None:
+        log(
+            f"queue full (HTTP {status}); waiting {delay:.1f}s "
+            f"(attempt {attempt}, Retry-After={retry_after:.1f}s)"
+        )
+
+    run = client.start_run_with_queue_wait(
+        str(run_id),
+        timeout_seconds=queue_timeout,
+        on_wait=on_queue_wait,
+    )
     log(f"run started: {run_id}  https://arc-bench.com/runs/{run_id}")
 
     seen: set[str] = set()
@@ -405,6 +436,38 @@ def cmd_submit(args: argparse.Namespace) -> int:
     write_record(path, record)
     log(f"result: {json.dumps(metrics, ensure_ascii=False)}")
     log(f"record: {path}")
+    return 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    env, config = _config(args)
+    if not config.session_cookie:
+        raise CliError(
+            "ARC_BENCH_SESSION_COOKIE is not configured; run `arcbench session`"
+        )
+    client = OfficialClient(config)
+    queue_timeout = _queue_timeout(args, config)
+
+    def on_queue_wait(
+        attempt: int,
+        retry_after: float,
+        delay: float,
+        status: int,
+        payload: Any,
+    ) -> None:
+        log(
+            f"queue full (HTTP {status}); waiting {delay:.1f}s "
+            f"(attempt {attempt}, Retry-After={retry_after:.1f}s)"
+        )
+
+    run = client.start_run_with_queue_wait(
+        args.run_id,
+        timeout_seconds=queue_timeout,
+        on_wait=on_queue_wait,
+    )
+    metrics = summarize_run(run)
+    log(f"run started: {args.run_id}")
+    log(f"result: {json.dumps(metrics, ensure_ascii=False)}")
     return 0
 
 
@@ -579,7 +642,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-wait", action="store_true")
     p.add_argument("--poll-interval", type=float, default=20.0)
     p.add_argument("--poll-timeout", type=float, default=3600.0)
+    p.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=None,
+        help="max seconds to wait for a platform queue slot; "
+        "defaults to ARC_BENCH_QUEUE_TIMEOUT_SECONDS (3600)",
+    )
     p.set_defaults(func=cmd_submit)
+
+    p = sub.add_parser("start", help="start an existing PENDING run, waiting for queue capacity")
+    p.add_argument("--run-id", required=True)
+    p.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=None,
+        help="max seconds to wait for a platform queue slot; "
+        "defaults to ARC_BENCH_QUEUE_TIMEOUT_SECONDS (3600)",
+    )
+    p.set_defaults(func=cmd_start)
 
     p = sub.add_parser("status", help="list runs, or poll one run")
     p.add_argument("--run-id")
