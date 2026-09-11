@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.arcbench/
+.pytest_cache/
+.venv*/
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+testsets/
+runs/
+*.zip

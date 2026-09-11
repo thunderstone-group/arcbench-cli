@@ -1,0 +1,430 @@
+"""HTTP and credential helpers for ARC-Bench.
+
+The platform contract implemented here was verified against the public
+ARC-Bench deployment:
+
+    GET  /api/auth/me
+    GET  /api/competitions
+    GET  /api/competitions/{id}
+    GET  /api/requirements/{task_id}/tests?catalog=competition
+    POST /api/submissions
+    POST /api/runs
+    GET  /api/runs/{id}
+
+Credentials are read from a local env file and are never written to output
+records. The module intentionally uses the Python standard library for its
+network and archive handling.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_BASE_URL = "https://arc-bench.com"
+DEFAULT_API_BASE_URL = "https://api.arc-bench.com/v1"
+DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_TIMEOUT = 60
+DEFAULT_MAX_SUBMISSIONS = 4
+DEFAULT_MIN_INTERVAL = 30.0
+
+TERMINAL_STATES = {
+    "PASSED",
+    "FAILED",
+    "ERROR",
+    "CANCELLED",
+    "CANCELED",
+    "TIMEOUT",
+}
+
+
+def _user_config_env() -> Path:
+    config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    )
+    return config_home / "arcbench" / ".env"
+
+
+def load_env(path: Path | None = None) -> dict[str, str]:
+    """Load env values without making the CLI depend on a lab checkout.
+
+    Lookup order for an explicit call:
+
+    1. the path passed by the caller;
+    2. ``ARCBENCH_ENV_FILE``;
+    3. ``.env`` in the current directory;
+    4. ``.env`` at the standalone source root;
+    5. ``~/.config/arcbench/.env``.
+
+    Real environment variables with the ``ARC_BENCH_`` prefix take precedence
+    over values from the file. This lets CI provide credentials without
+    creating a file on disk.
+    """
+    values: dict[str, str] = {}
+    if path is None:
+        candidates = [
+            os.environ.get("ARCBENCH_ENV_FILE"),
+            Path.cwd() / ".env",
+            Path(__file__).resolve().parents[2] / ".env",
+            _user_config_env(),
+        ]
+        path = next(
+            (Path(candidate) for candidate in candidates if candidate and Path(candidate).is_file()),
+            None,
+        )
+    if path is not None and path.is_file():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip("'\"")
+    for key, value in os.environ.items():
+        if key.startswith("ARC_BENCH_"):
+            values[key] = value
+    return values
+
+
+def redact(value: str | None) -> str | None:
+    """Return a deliberately non-reconstructable display form."""
+    if not value:
+        return value
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def sanitize(value: Any) -> Any:
+    """Remove credential-shaped fields before a record reaches disk."""
+    sensitive = (
+        "key",
+        "token",
+        "cookie",
+        "secret",
+        "password",
+        "authorization",
+        "session",
+    )
+    if isinstance(value, dict):
+        return {
+            key: "***" if any(word in key.lower() for word in sensitive) else sanitize(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize(item) for item in value]
+    return value
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_package(path: Path) -> dict[str, Any]:
+    """Validate a submission archive before any network write occurs."""
+    import zipfile
+
+    if not path.is_file():
+        raise ValueError(f"submission package not found: {path}")
+    if path.suffix.lower() != ".zip":
+        raise ValueError("submission package must be a .zip file")
+    if path.stat().st_size == 0:
+        raise ValueError("submission package is empty")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"submission package is not a valid ZIP: {path}") from error
+    if not {"main.py", "index.js", "index.ts"} & set(names):
+        raise ValueError("submission package has no root entrypoint (main.py / index.js / index.ts)")
+    if any(name.startswith(("/", "\\")) or ".." in Path(name).parts for name in names):
+        raise ValueError("submission package contains unsafe archive paths")
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+
+
+def build_multipart(
+    fields: dict[str, str],
+    file_field: str | None = None,
+    file_path: Path | None = None,
+    boundary: str | None = None,
+) -> tuple[bytes, str]:
+    boundary = boundary or f"----arcbench{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        chunks.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode()
+        )
+    if file_field and file_path:
+        chunks.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; "
+            f"filename=\"{file_path.name}\"\r\nContent-Type: application/zip\r\n\r\n".encode()
+        )
+        chunks.append(file_path.read_bytes())
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def unwrap(payload: Any, key: str) -> dict[str, Any]:
+    """Handle the platform's nested write responses."""
+    if isinstance(payload, dict) and isinstance(payload.get(key), dict):
+        return payload[key]
+    return payload if isinstance(payload, dict) else {"response": payload}
+
+
+@dataclass
+class SubmitConfig:
+    base_url: str = DEFAULT_BASE_URL
+    api_base_url: str = DEFAULT_API_BASE_URL
+    session_cookie: str = ""
+    api_key: str = ""
+    model: str = DEFAULT_MODEL
+    max_submissions: int = DEFAULT_MAX_SUBMISSIONS
+    min_interval_seconds: float = DEFAULT_MIN_INTERVAL
+    timeout_seconds: int = DEFAULT_TIMEOUT
+
+    @classmethod
+    def from_env(cls, env: dict[str, str]) -> "SubmitConfig":
+        return cls(
+            base_url=env.get("ARC_BENCH_WEB_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
+            api_base_url=env.get("ARC_BENCH_API_BASE_URL", DEFAULT_API_BASE_URL).rstrip("/"),
+            session_cookie=env.get("ARC_BENCH_SESSION_COOKIE", ""),
+            api_key=env.get("ARC_BENCH_API_KEY", ""),
+            model=env.get("ARC_BENCH_MODEL", DEFAULT_MODEL),
+            max_submissions=int(env.get("ARC_BENCH_MAX_SUBMISSIONS", DEFAULT_MAX_SUBMISSIONS)),
+            min_interval_seconds=float(
+                env.get("ARC_BENCH_MIN_INTERVAL_SECONDS", DEFAULT_MIN_INTERVAL)
+            ),
+            timeout_seconds=int(env.get("ARC_BENCH_HTTP_TIMEOUT_SECONDS", DEFAULT_TIMEOUT)),
+        )
+
+
+class OfficialClient:
+    def __init__(self, config: SubmitConfig):
+        self.config = config
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        data: bytes | None = None,
+        content_type: str | None = None,
+    ) -> tuple[int, Any]:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "arcbench-cli/0.1",
+        }
+        if self.config.session_cookie:
+            headers["Cookie"] = self.config.session_cookie
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        if data is not None and content_type:
+            request.add_header("Content-Type", content_type)
+        try:
+            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
+                body = response.read()
+                try:
+                    return response.status, json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return response.status, body.decode("utf-8", "replace")[:2000]
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8", "replace")
+            try:
+                return error.code, json.loads(raw)
+            except json.JSONDecodeError:
+                return error.code, raw[:2000]
+
+    # --- reads -----------------------------------------------------------
+
+    def check_login(self) -> dict[str, Any]:
+        if not self.config.session_cookie:
+            return {
+                "logged_in": False,
+                "reason": "ARC_BENCH_SESSION_COOKIE is not configured",
+            }
+        status, payload = self._request("GET", f"{self.config.base_url}/api/auth/me")
+        result: dict[str, Any] = {"logged_in": 200 <= status < 300, "http_status": status}
+        if isinstance(payload, dict) and isinstance(payload.get("user"), dict):
+            result["username"] = payload["user"].get("username")
+        return result
+
+    def list_competitions(self) -> list[dict[str, Any]]:
+        status, payload = self._request("GET", f"{self.config.base_url}/api/competitions")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"competition list failed ({status}): {payload}")
+        return payload if isinstance(payload, list) else []
+
+    def get_competition(self, competition_id: str) -> dict[str, Any]:
+        status, payload = self._request(
+            "GET", f"{self.config.base_url}/api/competitions/{competition_id}"
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"competition lookup failed ({status}): {payload}")
+        return payload if isinstance(payload, dict) else {}
+
+    def list_tasks(self, competition_id: str) -> list[dict[str, Any]]:
+        payload = self.get_competition(competition_id)
+        tasks = payload.get("tasks") if isinstance(payload, dict) else None
+        return tasks if isinstance(tasks, list) else []
+
+    def get_test_pack(self, task_id: str) -> dict[str, Any]:
+        status, payload = self._request(
+            "GET",
+            f"{self.config.base_url}/api/requirements/{task_id}/tests?catalog=competition",
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"test pack lookup failed ({status}): {payload}")
+        return payload if isinstance(payload, dict) else {}
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        status, payload = self._request("GET", f"{self.config.base_url}/api/runs/{run_id}")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"run lookup failed ({status}): {payload}")
+        return payload if isinstance(payload, dict) else {}
+
+    def list_runs(self, limit: int = 10) -> list[dict[str, Any]]:
+        status, payload = self._request("GET", f"{self.config.base_url}/api/runs")
+        if not 200 <= status < 300:
+            raise RuntimeError(f"run list failed ({status}): {payload}")
+        return (payload if isinstance(payload, list) else [])[:limit]
+
+    # --- writes ----------------------------------------------------------
+
+    def create_submission(
+        self,
+        package: Path,
+        competition_id: str,
+        name: str,
+        model: str,
+    ) -> dict[str, Any]:
+        fields = {
+            "runtime": "python",
+            "catalog": "competition",
+            "competition_id": competition_id,
+            "api_key": self.config.api_key,
+            "display_name": name,
+            "model_name": model,
+            "base_url": self.config.api_base_url,
+        }
+        body, content_type = build_multipart(fields, "file", package)
+        status, payload = self._request(
+            "POST", f"{self.config.base_url}/api/submissions", body, content_type
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"submission failed ({status}): {payload}")
+        return unwrap(payload, "submission")
+
+    def create_run(self, submission_id: str, requirement_id: str) -> dict[str, Any]:
+        body, content_type = build_multipart(
+            {
+                "submission_id": submission_id,
+                "requirement_id": requirement_id,
+            }
+        )
+        status, payload = self._request(
+            "POST", f"{self.config.base_url}/api/runs", body, content_type
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"run creation failed ({status}): {payload}")
+        return unwrap(payload, "run")
+
+    def poll_run(
+        self,
+        run_id: str,
+        interval: float = 5.0,
+        timeout: float = 1800.0,
+        on_tick=None,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        last: dict[str, Any] = {}
+        while True:
+            last = self.get_run(run_id)
+            state = str(last.get("status", "")).upper()
+            if on_tick:
+                on_tick(last)
+            if state in TERMINAL_STATES:
+                return last
+            if time.monotonic() >= deadline:
+                last["poll_timed_out"] = True
+                return last
+            time.sleep(interval)
+
+
+def progress_line(run: dict[str, Any]) -> str:
+    """Render one compact progress line for polling."""
+    steps = run.get("steps")
+    if isinstance(steps, list) and steps:
+        done = sum(1 for step in steps if str(step.get("status")) == "success")
+        active = next(
+            (step for step in steps if str(step.get("status")) in {"running", "info"}),
+            None,
+        )
+        current = active or (steps[done] if done < len(steps) else steps[-1])
+        return (
+            f"status={run.get('status')} step={current.get('key')} "
+            f"({current.get('title')}) {done}/{len(steps)}"
+        )
+    return (
+        f"status={run.get('status')} passed={run.get('passed_count')} "
+        f"failed={run.get('failed_count')}"
+    )
+
+
+def enforce_budget(
+    record_dir: Path,
+    config: SubmitConfig,
+    dry_run: bool = False,
+) -> None:
+    """Cap how many real submissions one machine can create, and pace them."""
+    records = sorted(record_dir.glob("*.json")) if record_dir.exists() else []
+    if dry_run:
+        return
+    if len(records) >= config.max_submissions:
+        raise RuntimeError(
+            f"submission budget exhausted: {len(records)}/{config.max_submissions}"
+        )
+    if records:
+        newest = max(item.stat().st_mtime for item in records)
+        remaining = config.min_interval_seconds - (time.time() - newest)
+        if remaining > 0:
+            raise RuntimeError(f"throttle active; retry in {remaining:.1f}s")
+
+
+def write_record(path: Path, record: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(sanitize(record), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def summarize_run(run: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a run object into the shared metric triple."""
+    return {
+        "status": run.get("status"),
+        "passed": run.get("passed_count"),
+        "failed": run.get("failed_count"),
+        "pass_rate": run.get("test_pass_rate", run.get("score")),
+        "tokens": run.get("token_count"),
+        "duration_seconds": run.get("run_duration_seconds"),
+        "failure_reason": run.get("failure_reason"),
+        "run_id": run.get("id"),
+        "submission_id": run.get("submission_id"),
+        "requirement_id": run.get("requirement_id"),
+        "finished_at": run.get("finished_at"),
+    }
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
