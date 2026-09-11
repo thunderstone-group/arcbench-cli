@@ -114,9 +114,26 @@ def sanitize(value: Any) -> Any:
         "authorization",
         "session",
     )
+    token_metrics = {
+        "tokens",
+        "token_count",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    }
+
+    def is_sensitive(key: str) -> bool:
+        normalized = key.lower().replace("-", "_")
+        if normalized in token_metrics:
+            return False
+        return any(word in normalized for word in sensitive)
+
     if isinstance(value, dict):
         return {
-            key: "***" if any(word in key.lower() for word in sensitive) else sanitize(item)
+            key: "***" if is_sensitive(key) else sanitize(item)
             for key, item in value.items()
         }
     if isinstance(value, list):

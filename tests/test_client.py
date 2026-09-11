@@ -60,12 +60,14 @@ class ClientTests(unittest.TestCase):
     def test_sanitize_removes_credentials(self) -> None:
         payload = {
             "api_key": "secret",
+            "tokens": 123,
             "nested": {"session_cookie": "cookie", "safe": "kept"},
         }
         self.assertEqual(
             sanitize(payload),
             {
                 "api_key": "***",
+                "tokens": 123,
                 "nested": {"session_cookie": "***", "safe": "kept"},
             },
         )
