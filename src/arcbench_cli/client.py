@@ -293,6 +293,16 @@ class OfficialClient:
             raise RuntimeError(f"run lookup failed ({status}): {payload}")
         return payload if isinstance(payload, dict) else {}
 
+    def get_run_logs(self, run_id: str) -> dict[str, Any]:
+        status, payload = self._request(
+            "GET", f"{self.config.base_url}/api/runs/{run_id}/logs"
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"run logs lookup failed ({status}): {payload}")
+        if isinstance(payload, dict):
+            return payload
+        return {"stdout": str(payload)}
+
     def list_runs(self, limit: int = 10) -> list[dict[str, Any]]:
         status, payload = self._request("GET", f"{self.config.base_url}/api/runs")
         if not 200 <= status < 300:
@@ -337,6 +347,24 @@ class OfficialClient:
         )
         if not 200 <= status < 300:
             raise RuntimeError(f"run creation failed ({status}): {payload}")
+        run = unwrap(payload, "run")
+        run_id = run.get("id") or run.get("run_id")
+        if not run_id:
+            raise RuntimeError(
+                "run creation response had no id: "
+                + json.dumps(run, ensure_ascii=False)[:300]
+            )
+        # Creating a run only persists it as PENDING. The platform's separate
+        # start endpoint performs the concurrency check and writes the outbox
+        # message that actually queues the Runner.
+        return self.start_run(str(run_id))
+
+    def start_run(self, run_id: str) -> dict[str, Any]:
+        status, payload = self._request(
+            "POST", f"{self.config.base_url}/api/runs/{run_id}/start"
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"run start failed ({status}): {payload}")
         return unwrap(payload, "run")
 
     def poll_run(

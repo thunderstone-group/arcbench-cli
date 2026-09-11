@@ -77,6 +77,7 @@ arcbench <command> [options]
 | `arcbench package` | `--lab-root <path>` | 打包 Harness ZIP，并输出大小和 SHA-256 |
 | `arcbench submit` | ZIP、竞赛、任务、模型、名称 | 创建提交与运行，轮询进度，写 JSON 结果记录 |
 | `arcbench status` | 无 `--run-id` 时列最近运行；有则读取一次 | 输出状态和 `(通过率, Token, 时间)` |
+| `arcbench logs` | `--run-id <id>` | 保存原始日志，并抽取 `REQUIREMENTS-BEGIN/END` 内容 |
 | `arcbench replay` | 归档应用或 manifest、测试集 | 调用 lab 的 `scripts/replay.py` 重放 |
 
 ## 常用流程
@@ -140,6 +141,12 @@ arcbench status \
   --record
 ```
 
+拉取一次运行的日志并提取探测需求：
+
+```bash
+arcbench logs --run-id <run-id> --out runs/official-requirements
+```
+
 ## 提交安全边界
 
 ARC-Bench 当前对同一竞赛只允许最新一次 submission 被运行。新提交可能让旧的待运行 submission 失效，因此不要把 `submit` 放进高频循环。
@@ -153,6 +160,10 @@ CLI 内置三道本地保护：
 这些保护只作用于本机，不能协调队友从浏览器或另一台机器提交。多人共用账号时，仍需要一个外部约定或真正的共享排队器。
 
 CLI 只做比赛允许的 Harness 提交和结果读取，不修改测试、计量器、系统时间或评分逻辑。
+
+平台创建 run 和启动 run 是两个调用：`POST /api/runs` 先创建 `PENDING` 记录，
+`POST /api/runs/{run_id}/start` 才会进入调度队列。CLI 会把两步连起来，
+避免出现“提交成功但永远 PENDING”的假状态。
 
 ## 环境变量
 

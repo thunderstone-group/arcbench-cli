@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -276,6 +277,30 @@ def _record_path(record_dir: Path, competition: str, task: str) -> Path:
     return record_dir / f"{stamp}-{competition}-{task}.json"
 
 
+def extract_marked_block(
+    text: str,
+    begin: str = "REQUIREMENTS-BEGIN",
+    end: str = "REQUIREMENTS-END",
+) -> str | None:
+    """Extract a marked block while removing runner log-line prefixes."""
+    start = text.find(begin)
+    finish = text.find(end, start + len(begin)) if start >= 0 else -1
+    if start < 0 or finish < 0:
+        return None
+    newline = text.find("\n", start)
+    if newline < 0 or newline >= finish:
+        return None
+    lines = []
+    for line in text[newline + 1 : finish].splitlines():
+        line = re.sub(
+            r"^\[[^\]]+\] \[runner\] generation-agent\.stdout \| ?",
+            "",
+            line,
+        )
+        lines.append(line)
+    return "\n".join(lines).strip() + "\n"
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     env, config = _config(args)
     package = validate_package(Path(args.package).expanduser().resolve())
@@ -380,6 +405,42 @@ def cmd_submit(args: argparse.Namespace) -> int:
     write_record(path, record)
     log(f"result: {json.dumps(metrics, ensure_ascii=False)}")
     log(f"record: {path}")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    env, config = _config(args)
+    if not config.session_cookie:
+        raise CliError(
+            "ARC_BENCH_SESSION_COOKIE is not configured; run `arcbench session`"
+        )
+    client = OfficialClient(config)
+    payload = client.get_run_logs(args.run_id)
+    out_dir = (
+        Path(args.out).expanduser().resolve()
+        if args.out
+        else (Path.cwd() / ".arcbench" / "runs" / "logs" / args.run_id).resolve()
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logs_path = out_dir / f"{args.run_id}-logs.json"
+    logs_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    log(f"logs: {logs_path}")
+
+    text = "\n".join(
+        str(value)
+        for key in ("stdout", "stderr", "console", "events")
+        if (value := payload.get(key))
+    )
+    requirements = extract_marked_block(text)
+    if requirements is None:
+        log("no REQUIREMENTS-BEGIN/END markers found")
+        return 0
+    requirements_path = out_dir / "requirements.md"
+    requirements_path.write_text(requirements, encoding="utf-8")
+    log(f"captured requirements ({len(requirements)} chars): {requirements_path}")
     return 0
 
 
@@ -531,6 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--poll-interval", type=float, default=20.0)
     p.add_argument("--poll-timeout", type=float, default=3600.0)
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("logs", help="download one run's logs and capture marked requirements")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--out", help="output directory")
+    p.set_defaults(func=cmd_logs)
 
     p = sub.add_parser("replay", help="re-score an archived app against any suite")
     p.add_argument("--lab-root")

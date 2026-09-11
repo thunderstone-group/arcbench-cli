@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from arcbench_cli.cli import build_parser
+from arcbench_cli.cli import build_parser, extract_marked_block
 
 
 class CliParserTests(unittest.TestCase):
@@ -37,6 +37,15 @@ class CliParserTests(unittest.TestCase):
             ["fetch", "--competition", "smoke", "--out", "/tmp/tests"]
         )
         self.assertEqual(args.out, "/tmp/tests")
+
+    def test_extract_marked_block_removes_runner_prefixes(self) -> None:
+        text = (
+            "[time] [runner] generation-agent.stdout | REQUIREMENTS-BEGIN (5 chars)\n"
+            "[time] [runner] generation-agent.stdout | hello\n"
+            "[time] [runner] generation-agent.stdout | world\n"
+            "[time] [runner] generation-agent.stdout | REQUIREMENTS-END\n"
+        )
+        self.assertEqual(extract_marked_block(text), "hello\nworld\n")
 
 
 if __name__ == "__main__":

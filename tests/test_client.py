@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from arcbench_cli.client import (
+    OfficialClient,
     SubmitConfig,
     build_multipart,
     load_env,
@@ -90,6 +91,31 @@ class ClientTests(unittest.TestCase):
         config = SubmitConfig.from_env({})
         self.assertEqual(config.max_submissions, 4)
         self.assertEqual(config.min_interval_seconds, 30.0)
+
+    def test_create_run_starts_pending_run(self) -> None:
+        class FakeClient(OfficialClient):
+            def __init__(self) -> None:
+                super().__init__(SubmitConfig())
+                self.calls: list[tuple[str, str]] = []
+
+            def _request(self, method, url, data=None, content_type=None):
+                self.calls.append((method, url))
+                if url.endswith("/api/runs"):
+                    return 200, {"run": {"id": "run-1", "status": "PENDING"}}
+                if url.endswith("/api/runs/run-1/start"):
+                    return 200, {"id": "run-1", "status": "QUEUED"}
+                raise AssertionError(url)
+
+        client = FakeClient()
+        run = client.create_run("submission-1", "smoke--counter")
+        self.assertEqual(run["status"], "QUEUED")
+        self.assertEqual(
+            client.calls,
+            [
+                ("POST", "https://arc-bench.com/api/runs"),
+                ("POST", "https://arc-bench.com/api/runs/run-1/start"),
+            ],
+        )
 
 
 if __name__ == "__main__":
