@@ -4,13 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arcbench-cli"
-version = "0.1.0"
-description = "A small CLI for ARC-Bench competition discovery, submission, polling, and local replay."
+version = "0.2.0"
+description = "A standard-library CLI for ARC-Bench competition discovery, submission, and run inspection."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-  "cryptography>=41",
-]
+dependencies = []
 
 [project.scripts]
 arcbench = "arcbench_cli.cli:main"
