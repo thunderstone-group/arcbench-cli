@@ -1,0 +1,63 @@
+{
+  "provenance": {
+    "source": "GET /api/runs/{id} on the public ARC-Bench deployment",
+    "observed_on": "2026-09-11",
+    "kind": "field shapes from a real response; identifiers replaced",
+    "omitted": "Account ids, run id, file paths, logs, and fields the CLI does not render."
+  },
+  "run": {
+    "id": "run-shape-fixture",
+    "status": "PASSED",
+    "score": 100.0,
+    "test_pass_rate": 100.0,
+    "passed_count": 2,
+    "failed_count": 0,
+    "run_duration_seconds": 18,
+    "token_count": 35668,
+    "token_cost_usd": 0.026695,
+    "token_cost_currency": "CNY",
+    "failure_reason": null,
+    "tests": [
+      {
+        "name": "REQ-1: preserve increment and decrement behavior",
+        "status": "passed",
+        "passed": true,
+        "duration_ms": 393,
+        "error": null,
+        "file": "REQ-1.spec.ts",
+        "req_id": null,
+        "scenario_id": null
+      },
+      {
+        "name": "REQ-2: reset a changed count to zero",
+        "status": "passed",
+        "passed": true,
+        "duration_ms": 310,
+        "error": null,
+        "file": "REQ-2.spec.ts",
+        "req_id": null,
+        "scenario_id": null
+      }
+    ],
+    "steps": [
+      {
+        "key": "deploy_agent",
+        "title": "Preparing environment",
+        "status": "completed",
+        "description": "Done"
+      },
+      {
+        "key": "start_agent",
+        "title": "Running agent",
+        "status": "completed",
+        "description": "Done"
+      },
+      {
+        "key": "run_tests",
+        "title": "Evaluating result",
+        "status": "completed",
+        "description": "Done"
+      }
+    ]
+  }
+}
