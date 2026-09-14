@@ -183,6 +183,14 @@ Behaviour that follows from those rules:
 A coding agent (Claude Code, Codex, or any harness) can drive this CLI end to end
 without a browser and without a human in the loop, once the login exists.
 
+### Agent skill
+
+For an agent that supports the [Agent Skills](https://code.claude.com/docs/en/skills)
+format, copy [`skills/arcbench/`](skills/arcbench/) into its skills directory —
+for Claude Code, `~/.claude/skills/arcbench/` or a project's `.claude/skills/`;
+for Codex, its skills directory — and the agent picks it up automatically. The
+skill is a condensed version of this section, kept in sync with it.
+
 **One-time human setup.** A person runs `arcbench session` on a Mac that is signed
 in to the site; it raises a keychain prompt, which is why an agent cannot do it.
 After that the agent only needs the env file path:
@@ -461,6 +469,13 @@ agent 用这个。
 
 登录一旦建立，编码 agent（Claude Code、Codex 或任何 harness）就能不开浏览器、不需要人
 盯着，把整条链路跑完。
+
+### Agent Skill
+
+如果所用 agent 支持 [Agent Skills](https://code.claude.com/docs/en/skills) 格式，把
+[`skills/arcbench/`](skills/arcbench/) 整个目录拷进它的 skills 目录即可自动生效——
+Claude Code 是 `~/.claude/skills/arcbench/` 或项目内的 `.claude/skills/`，Codex 用它
+自己的 skills 目录。这份 skill 是本节的精简版，与本节保持同步。
 
 **只有一步需要人。** 由人在一台已登录该网站的 Mac 上跑 `arcbench session`，它会弹钥匙串
 授权，所以 agent 自己做不了。之后 agent 只需要知道 env 文件在哪：
