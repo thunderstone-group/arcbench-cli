@@ -178,6 +178,123 @@ Behaviour that follows from those rules:
   result. `wait` tolerates two consecutive transport or 5xx failures, then
   re-reads; a third gives up rather than guessing.
 
+## Agent integration
+
+A coding agent (Claude Code, Codex, or any harness) can drive this CLI end to end
+without a browser and without a human in the loop, once the login exists.
+
+**One-time human setup.** A person runs `arcbench session` on a Mac that is signed
+in to the site; it raises a keychain prompt, which is why an agent cannot do it.
+After that the agent only needs the env file path:
+
+```sh
+export ARCBENCH_ENV_FILE=~/.config/arcbench/volo.env
+```
+
+Keep the team's env file outside the repository. Every command reads it, so no
+credential ever appears on a command line or in an agent's transcript.
+
+**Parse, do not scrape.** Pass `--json` and every command prints one compact JSON
+record, or a JSON array, on stdout. Never regex the default pretty output: it is
+formatted for people and may change.
+
+```sh
+arcbench --json whoami
+arcbench --json status RUN_ID
+```
+
+Two details about the streams. Diagnostic lines such as a queue-full notice also go
+to stdout, but every one of them is prefixed `[arcbench] `, so parse each stdout line
+as JSON and skip the lines that start with that prefix. When a request fails under
+`--json`, the error record is printed to **stderr**, not stdout, so capture both.
+
+**Exit codes.** The table under [Exit codes](#exit-codes) is the contract. Two
+points matter to an agent in particular:
+
+* `wait` exits `0` when the run PASSED, `1` when it reached a non-passing terminal
+  state, and `2` when the **local** deadline expired. A `2` says nothing about the
+  run, which is still going; re-enter `wait` or poll `status`.
+* `status RUN_ID` exits `1` for any run that is not PASSED, **including one that is
+  still running**. Do not read that as failure. Read the `status` field in the JSON.
+
+### The loop
+
+```
+package  →  upload (verify hash)  →  run  →  wait  →  status / logs / source  →  leaderboard
+```
+
+1. `arcbench package --from ./agent --out dist/agent.zip`, or your own packager.
+2. `arcbench upload dist/agent.zip --competition C --name NAME`. This saves the
+   submission, downloads the stored archive back and compares SHA-256 against the
+   local file. Exit `1` means the stored copy does not match what you built; the
+   record still carries `submission.id`, so inspect rather than re-upload blindly.
+3. `arcbench run SUBMISSION_ID --task C--TASK`. Create and start are two API calls.
+   If start fails the record carries `run_id` and `start_error`, and the run exists.
+   Resume it with `arcbench start RUN_ID`; never call `run` again, which would create
+   a second run.
+4. `arcbench wait RUN_ID --interval 20 --timeout 3600`. With `--json` it emits one
+   line per observed state change, so an agent can stream progress.
+5. Evidence, after the fact: `status RUN_ID --full` for the whole redacted response,
+   `logs RUN_ID --tail 40` plus `--offset` to page, `source RUN_ID PATH --output F`
+   for one file out of the generated workspace.
+6. `leaderboard --competition C --task T` for where the result landed.
+
+`arcbench submit` collapses steps 2 to 4 into one command and writes a JSON result
+record under `--record-dir`. Prefer it for unattended use; it enforces
+`ARC_BENCH_MAX_SUBMISSIONS` and `ARC_BENCH_MIN_INTERVAL_SECONDS`.
+
+Three platform rules bind the loop, and an agent must respect them even though the
+CLI cannot enforce all of them: never let two runs on one account overlap, because
+the official token count is a usage-meter delta on the shared access key and cannot
+tell two sources apart; never upload while a run from the same submission is
+pending; remember the board shows the latest passing run, not the best one. If the
+agent also calls the model gateway locally, that traffic must pause while an official
+run is in flight, or it is charged to the run's score.
+
+### What an agent must never do
+
+* **Run two things at once on one key.** No parallel `run`, no local gateway calls
+  during an official run. Both corrupt the official token count.
+* **Upload while a run is pending.** Finish or `cancel` first.
+* **Retry a mutating call after an error.** `upload`, `run`, `start` and `cancel` are
+  writes. When the outcome cannot be observed the error says `outcome_uncertain` and
+  names the id; read that id's state and decide, rather than repeating the call. The
+  one automatic retry that exists is capacity backoff inside `run`, on the same run id.
+* **Print or log a credential.** Never echo the env file, never pass a cookie or
+  model key as an argument, never commit either. Output is already redacted; do not
+  work around it.
+* **Treat a truncated or 5xx response as a result.** The client reports those as
+  transport failures on purpose.
+
+### A minimal transcript
+
+Real output from a live account, ids and team name kept, nothing else:
+
+```console
+$ export ARCBENCH_ENV_FILE=~/.config/arcbench/volo.env
+$ arcbench --json whoami
+{"logged_in":true,"http_status":200,"username":"VOLO-AI","registration_source":"hackathon"}
+
+$ arcbench --json status e34e78400983
+{"run_id":"e34e78400983","status":"PASSED","passed":10,"failed":0,"pass_rate":100.0,
+ "tokens":143279,"duration_seconds":372,"failure_reason":null,
+ "submission_id":"cc2ade061bc7","requirement_id":"ticket-booking--ticket-booking",
+ "model_name":"deepseek-v4-flash","cost":{"amount":0.899558,"currency":"CNY"},
+ "steps":[{"key":"deploy_agent","status":"completed","description":"Done"},
+          {"key":"start_agent","status":"completed","description":"Done"},
+          {"key":"run_tests","status":"completed","description":"Done"}],
+ "failed_tests":[]}
+$ echo $?
+0
+
+$ arcbench --json leaderboard --competition ticket-booking --task ticket-booking --team 'VOLO AI'
+[{"rank":7,"username":"VOLO AI","model_name":"deepseek-v4-flash","avg_pass_rate":100.0,
+  "total_token_millions":0.143,"total_token_cost":0.899558,"token_cost_currency":"CNY",
+  "cost_efficiency":111.1657,"efficiency_eligible":true,"avg_runtime_seconds":372}]
+```
+
+The JSON above is printed as one line per record; it is wrapped here to fit.
+
 ## API routes
 
 The contract below was read from the deployed front-end bundle and verified
@@ -339,6 +456,110 @@ agent 用这个。
   `submit` 能创建的真实提交数量。
 * HTTP 响应体被截断一律算传输失败，绝不当成运行结果。`wait` 容忍连续两次传输或 5xx
   失败后重读，第三次就放弃而不是猜。
+
+## Agent 接入
+
+登录一旦建立，编码 agent（Claude Code、Codex 或任何 harness）就能不开浏览器、不需要人
+盯着，把整条链路跑完。
+
+**只有一步需要人。** 由人在一台已登录该网站的 Mac 上跑 `arcbench session`，它会弹钥匙串
+授权，所以 agent 自己做不了。之后 agent 只需要知道 env 文件在哪：
+
+```sh
+export ARCBENCH_ENV_FILE=~/.config/arcbench/volo.env
+```
+
+env 文件放在仓库之外。所有命令都从它读凭据，因此凭据不会出现在命令行参数里，也不会
+落进 agent 的对话记录。
+
+**解析，不要抓取。** 加 `--json`，每条命令在 stdout 上输出一行紧凑 JSON 或一个 JSON
+数组。不要用正则去抠默认的人类可读输出，那是给人看的，随时可能改。
+
+```sh
+arcbench --json whoami
+arcbench --json status RUN_ID
+```
+
+关于输出流有两点要注意：排队提示之类的诊断信息同样走 stdout，但它们一律带
+`[arcbench] ` 前缀，所以按行解析 JSON、跳过带该前缀的行即可；而 `--json` 模式下请求
+失败时，错误记录打到 **stderr** 而不是 stdout，两个流都要收。
+
+**退出码。** 契约见上文[退出码表](#exit-codes)。对 agent 尤其重要的是两条：
+
+* `wait` 在运行 PASSED 时退 `0`，进入非通过终态时退 `1`，**本地**等待超时退 `2`。`2`
+  不代表运行有任何问题，它还在跑；重新 `wait` 或改用 `status` 轮询即可。
+* `status RUN_ID` 对任何非 PASSED 的运行都退 `1`，**包括还在运行中的**。不要把它当成
+  失败，去读 JSON 里的 `status` 字段。
+
+### 主循环
+
+```
+package  →  upload（校验哈希）  →  run  →  wait  →  status / logs / source  →  leaderboard
+```
+
+1. `arcbench package --from ./agent --out dist/agent.zip`，或者用你自己的打包脚本。
+2. `arcbench upload dist/agent.zip --competition C --name NAME`。它保存提交后会把服务端
+   存下的归档下载回来，和本地文件对 SHA-256。退 `1` 表示服务端那份和你构建的不一致；
+   记录里仍带着 `submission.id`，应该去查，而不是闭眼重传。
+3. `arcbench run SUBMISSION_ID --task C--TASK`。创建和启动是两个请求。启动失败时记录里
+   带 `run_id` 和 `start_error`，而这个运行**已经存在**，用 `arcbench start RUN_ID` 接着
+   启动，绝不要再跑一次 `run`，那会创建第二个运行。
+4. `arcbench wait RUN_ID --interval 20 --timeout 3600`。配 `--json` 时，状态每变化一次
+   输出一行，agent 可以据此流式汇报进度。
+5. 事后取证：`status RUN_ID --full` 拿整份脱敏响应，`logs RUN_ID --tail 40` 配 `--offset`
+   翻页，`source RUN_ID PATH --output F` 从生成的工作区里取单个文件。
+6. `leaderboard --competition C --task T` 看结果落在哪。
+
+`arcbench submit` 把第 2 到第 4 步合成一条命令，并把 JSON 结果记录写到 `--record-dir`。
+无人值守时优先用它，它还会执行 `ARC_BENCH_MAX_SUBMISSIONS` 和
+`ARC_BENCH_MIN_INTERVAL_SECONDS` 的限制。
+
+有三条平台规则约束着这个循环，CLI 并不能全部替你强制执行，agent 必须自己守住：同一账号
+的两次运行绝不能重叠，因为官方 token 计数是共享 access key 上的计量差值，分不清两个来源；
+上一份提交还有运行 pending 时不要再上传；排行榜展示的是**最近一次通过**的运行，不是最好
+的那次。如果 agent 自己也在本地调模型网关，官方运行期间这些调用必须暂停，否则会被算进
+那次运行的分数。
+
+### agent 绝对不能做的事
+
+* **同一个 key 上并行做两件事。** 不并发 `run`，官方运行期间不打本地网关。两者都会污染
+  官方 token 计数。
+* **有运行 pending 时上传。** 先跑完或 `cancel`。
+* **报错后盲目重试写请求。** `upload`、`run`、`start`、`cancel` 都是写。结果无法观测时，
+  错误里会带 `outcome_uncertain` 并给出该查的 id；去读那个 id 的状态再决定，而不是重复
+  调用。唯一存在的自动重试是 `run` 内部对容量不足的退避，且只针对同一个 run id。
+* **打印或记录凭据。** 不要 echo env 文件，不要把 cookie 或模型 key 放进命令行参数，也
+  不要提交进 Git。输出本身已经脱敏，不要绕过它。
+* **把截断响应或 5xx 当结果。** 客户端故意把它们报成传输失败。
+
+### 一份最小实录
+
+来自真实账号的真实输出，除 id 和队名外未做改动：
+
+```console
+$ export ARCBENCH_ENV_FILE=~/.config/arcbench/volo.env
+$ arcbench --json whoami
+{"logged_in":true,"http_status":200,"username":"VOLO-AI","registration_source":"hackathon"}
+
+$ arcbench --json status e34e78400983
+{"run_id":"e34e78400983","status":"PASSED","passed":10,"failed":0,"pass_rate":100.0,
+ "tokens":143279,"duration_seconds":372,"failure_reason":null,
+ "submission_id":"cc2ade061bc7","requirement_id":"ticket-booking--ticket-booking",
+ "model_name":"deepseek-v4-flash","cost":{"amount":0.899558,"currency":"CNY"},
+ "steps":[{"key":"deploy_agent","status":"completed","description":"Done"},
+          {"key":"start_agent","status":"completed","description":"Done"},
+          {"key":"run_tests","status":"completed","description":"Done"}],
+ "failed_tests":[]}
+$ echo $?
+0
+
+$ arcbench --json leaderboard --competition ticket-booking --task ticket-booking --team 'VOLO AI'
+[{"rank":7,"username":"VOLO AI","model_name":"deepseek-v4-flash","avg_pass_rate":100.0,
+  "total_token_millions":0.143,"total_token_cost":0.899558,"token_cost_currency":"CNY",
+  "cost_efficiency":111.1657,"efficiency_eligible":true,"avg_runtime_seconds":372}]
+```
+
+上面每条记录实际输出为一行，这里为了排版做了折行。
 
 ## 接口路由表
 
