@@ -236,10 +236,7 @@ touches the network.
 
 ## License
 
-**Not yet open source.** [`LICENSE`](LICENSE) is currently an all-rights-reserved
-internal notice, not the MIT license. Replacing it is a decision for the
-copyright holder and must happen before this repository is made public. Until
-then, treat the code as internal.
+MIT. See [`LICENSE`](LICENSE).
 
 ---
 
@@ -369,5 +366,4 @@ cookie 亲和、截断响应、脱敏、跨 origin 重定向边界、归档校�
 
 ## 许可
 
-**尚未开源。**[`LICENSE`](LICENSE) 目前是保留所有权利的内部声明，不是 MIT。替换它
-属于版权持有方的决定，必须在仓库公开之前完成。在此之前请按内部代码对待。
+MIT，见 [`LICENSE`](LICENSE)。
