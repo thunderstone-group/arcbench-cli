@@ -55,19 +55,37 @@ package → upload (verify hash) → run → wait → status / logs / source →
 arcbench package --from ./agent --out dist/agent.zip
 arcbench upload dist/agent.zip --competition ticket-booking --name my-agent-v3
 arcbench run SUBMISSION_ID --task ticket-booking--ticket-booking
-arcbench wait RUN_ID --interval 20 --timeout 3600
+arcbench run SUBMISSION_ID --all-tasks          # or repeat --task; one run per task, overlapping
+arcbench wait RUN_A RUN_B --interval 20 --timeout 3600
 arcbench status RUN_ID --full          # or: logs RUN_ID --tail 40, source RUN_ID PATH --output F
 arcbench leaderboard --competition ticket-booking --task ticket-booking
 ```
 
+Account and gateway, neither needing a browser cookie — both log in to the
+metering site with the gateway access key:
+
+```sh
+arcbench balance                       # account, balance, currency, as_of, pending events
+arcbench models                        # every gateway model, provider and price
+arcbench usage --granularity day       # metered spend per bucket and model, with a total
+arcbench requests --limit 20           # the newest billed gateway calls
+```
+
+**Check `balance` before starting a batch of runs** — see the platform rules below.
+The meter ignores its own `granularity`, `since` and `limit` parameters, so `usage`
+merges hours into days itself and `requests --limit` takes the newest N locally;
+`usage` also takes `--since ISO` and `--model M`.
+
 Notes per step: **upload** downloads the stored archive back and compares
 SHA-256 against the local file — exit `1` means they don't match; the JSON record
 still has `submission.id`, so inspect it rather than blindly re-uploading.
-**run** creates and starts in two API calls; if start fails, the record carries
-`run_id` and `start_error` — the run exists, so resume with `arcbench start
-RUN_ID`, never call `run` again (that creates a second run). **wait** with
-`--json` emits one line per observed state change, so an agent can stream
-progress. **logs** takes `--offset` to continue from a cursor.
+**run** creates and starts in two API calls per task and prints a JSON array,
+one entry per task; if a start fails, that entry carries `run_id` and
+`start_error` — the run exists, so resume with `arcbench start RUN_ID`, never
+call `run` again (that creates a second run), and the remaining tasks still
+start. **wait** takes several run ids, polls them round-robin, and with `--json`
+emits one line per observed state change, each carrying its `run_id`. **status**
+also takes several ids. **logs** takes `--offset` to continue from a cursor.
 
 `arcbench submit` collapses upload/run/wait into one command and writes a JSON
 result record under `--record-dir`. Prefer it for unattended use; it enforces
@@ -76,13 +94,16 @@ result record under `--record-dir`. Prefer it for unattended use; it enforces
 ```sh
 arcbench submit --package dist/agent.zip \
   --competition ticket-booking --task ticket-booking--ticket-booking --name my-agent-v3
+arcbench submit --package dist/agent.zip --competition arc-bench-web --all-tasks
 ```
 
 ## Exit codes
 
-`0` success (for `wait`, `status RUN_ID` and `submit`, the run PASSED); `1` a
-request failed, or the run reached a non-passing terminal state; `2` the local
-waiting deadline expired, or the session is not logged in. Two traps: `wait`
+`0` success (for `wait`, `status RUN_ID` and `submit`, every run PASSED); `1` a
+request failed, a task failed to start, or a run reached a non-passing terminal
+state; `2` the local waiting deadline expired, or the session is not logged in.
+With several runs: `1` if any finished without passing, else `2` if any was still
+going at the deadline. Two traps: `wait`
 exiting `2` means the **local** deadline expired, not that the run failed — it is
 still going, so re-enter `wait` or poll `status`. `status RUN_ID` exits `1` for
 any run that is not PASSED, **including one still running** — read the `status`
@@ -91,14 +112,26 @@ field in the JSON, don't treat exit `1` as failure. `leaderboard` requires
 
 ## Platform rules the CLI cannot fully enforce — the agent must
 
-- **Never let two runs on one account overlap**, including a local model gateway
-  call during an official run. The official token count is a usage-meter delta on
-  the shared access key; concurrent traffic corrupts it. Finish or `cancel` a run
-  before starting another.
-- **Never upload while a run from the same submission is still pending.** The
-  server keeps only the latest saved submission per competition, so a new upload
-  can strand a run you're waiting on. Finish or `cancel` first.
-- **The leaderboard shows the latest passing run, not the best one.**
+- **Run concurrently by default.** The platform runs submissions and tasks at the
+  same time. Measured 2026-09-15: two saved submissions for `arc-bench-web` held
+  seven runs `RUNNING` at once — five tasks of one and two of the other — all past
+  `deploy_agent`, none stranded. There is no rule against overlapping runs, and no
+  rule against uploading while a run is pending; earlier versions of this skill
+  said there was, and were wrong.
+- **A concurrent run's cost column is meaningless.** The official token count is a
+  usage-meter delta on the shared access key and cannot tell whose traffic it
+  measured: in the same 2026-09-15 batch all seven runs were stamped with roughly
+  the same figures (`Meter usage captured: tokens=29910448, cost=36.452976 CNY`),
+  each delta spanning the whole batch. That is what the cost-efficiency ranking
+  (senior tier, pass rate ≥ 80%) reads; pass rate is unaffected. Serialize only
+  when the cost figure matters.
+- **The balance is a shared hard ceiling. Run `arcbench balance` before a batch.**
+  That batch drove the account to −1.35 CNY; the gateway then returned HTTP 402
+  `insufficient_balance` and every run failed in generation — all seven FAILED for
+  that reason, not for anything in the agents. Concurrency multiplies the burn
+  rate. Afterwards, `arcbench usage` shows where the money went.
+- **The leaderboard shows the latest completed run per task, not the best one.**
+  A competition score is the highest average across every saved submission.
 - **Never retry a mutating call** (`upload`, `run`, `start`, `cancel`) after an
   error. When the outcome can't be observed, the error carries `outcome_uncertain`
   and the id to inspect — read that id's state and decide, don't repeat the call.
@@ -133,21 +166,34 @@ session`（会弹钥匙串授权），之后把结果 env 文件路径交给 age
 `[arcbench] ` 前缀，按行跳过；请求失败时错误记录在 **stderr**，两个流都要收。
 
 **主循环**：`package → upload（校验哈希） → run → wait → status/logs/source →
-leaderboard`，各步示例见上文英文部分，命令与参数完全一致。无人值守场景优先用
-`arcbench submit`，一条命令收敛 upload/run/wait 并写 JSON 结果记录。
+leaderboard`，各步示例见上文英文部分，命令与参数完全一致。`run` 和 `submit` 的 `--task`
+可重复、也可换成 `--all-tasks` 一次起完整个赛题；`wait` 和 `status` 能一次接多个 run id。
+无人值守场景优先用 `arcbench submit`，一条命令收敛 upload/run/wait 并写 JSON 结果记录。
 
-**退出码**：`0` 成功；`1` 请求失败或运行进入非通过终态；`2` 本地等待超时或未登录。
-`wait` 退 `2` 不代表运行失败，它还在跑。`status RUN_ID` 对任何非 PASSED（包括仍在
-运行）的运行都退 `1`，要读 JSON 里的 `status` 字段而不是看退出码。`leaderboard`
-必须带 `--competition`。
+**账号与网关**：`balance`、`models`、`usage`、`requests` 都用网关 access key 登录计量站，
+**不需要浏览器 cookie**，分别给出余额/账期、模型价格表、分桶用量、计费请求流水。**开一批运行
+之前先跑 `balance`**，原因见下。计量站不认自己的 `granularity`/`since`/`limit` 参数，所以按天
+合并和取最新 N 条都由客户端做。
 
-**平台三条硬规则**（CLI 不能替 agent 全部强制执行）：同一账号的两次运行绝不能重
-叠（token 计数是共享 key 上的计量差值）；上一份提交还有运行 pending 时不要再传新
-包；排行榜展示的是最近一次通过的运行，不是最好的那次。
+**退出码**：`0` 成功；`1` 请求失败、有任务没启动成功，或有运行进入非通过终态；`2` 本地
+等待超时或未登录。多个运行时：只要有一个跑完且没通过就是 `1`，否则只要有一个到点还没跑完
+就是 `2`。`wait` 退 `2` 不代表运行失败，它还在跑。`status RUN_ID` 对任何非 PASSED（包括仍
+在运行）的运行都退 `1`，要读 JSON 里的 `status` 字段而不是看退出码。`leaderboard` 必须带
+`--competition`。
 
-**绝对不能做**：同一 key 上并行做两件事；运行 pending 时上传；报错后盲目重试写请
-求（`upload`/`run`/`start`/`cancel`，改读 `outcome_uncertain` 给出的 id 状态再决
-定）；打印、记录或提交凭据。
+**平台真实规则**（CLI 不能替 agent 全部强制执行）：**默认就并发**——平台本身并发跑提交和
+任务，2026-09-15 实测 `arc-bench-web` 下两份提交同时有七个运行在 `RUNNING`（一份五个任务、
+另一份两个），全部越过 `deploy_agent` 且没有一个被挤掉；本 skill 早先写的「运行不能重叠」
+「pending 时不能上传」两条都不成立，已删。**并发运行的成本列没有意义**：官方 token 计数是共享
+access key 上的计量差值，分不清测到的是谁的流量——同一批七个运行被打上了几乎相同的数字
+（`Meter usage captured: tokens=29910448, cost=36.452976 CNY`），每个差值都横跨整批。性价比榜
+（senior 档，通过率 ≥ 80%）读的正是它，通过率不受影响，所以只有在乎成本数字时才串行。
+**余额是共享的硬上限**：那一批把账户打到 −1.35 CNY，之后网关返回 HTTP 402
+`insufficient_balance`，七个运行全部在生成阶段失败——开批之前先 `arcbench balance`。排行榜展示的是每个任务最近一次
+**完成**的运行，赛题总分取所有已保存提交里最高的那个平均值。
+
+**绝对不能做**：量 token 的运行旁边继续花这把 key；报错后盲目重试写请求（`upload`/`run`/
+`start`/`cancel`，改读 `outcome_uncertain` 给出的 id 状态再决定）；打印、记录或提交凭据。
 
 **参考**：精确参数见 `arcbench <command> --help`；完整说明见仓库 README 的
 「Agent 接入」与「排队与频率约束」两节。

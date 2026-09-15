@@ -25,6 +25,9 @@ COMMANDS = {
     "session",
     "whoami",
     "balance",
+    "models",
+    "usage",
+    "requests",
     "tasks",
     "competitions",
     "fetch",
@@ -61,6 +64,20 @@ class CliParserTests(unittest.TestCase):
         )
         self.assertEqual(args.func.__name__, "cmd_submit")
         self.assertTrue(args.dry_run)
+        self.assertEqual(args.task, ["smoke--counter"])
+
+    def test_run_and_submit_take_repeated_tasks_or_all_tasks(self) -> None:
+        run_args = build_parser().parse_args(
+            ["run", "submission-1", "--task", "smoke--a", "--task", "smoke--b"]
+        )
+        self.assertEqual(run_args.task, ["smoke--a", "smoke--b"])
+        self.assertFalse(run_args.all_tasks)
+        self.assertTrue(build_parser().parse_args(["run", "submission-1", "--all-tasks"]).all_tasks)
+        submit_args = build_parser().parse_args(
+            ["submit", "--package", "c.zip", "--competition", "smoke", "--all-tasks"]
+        )
+        self.assertTrue(submit_args.all_tasks)
+        self.assertIsNone(submit_args.task)
 
     def test_package_takes_a_source_directory_not_a_lab_checkout(self) -> None:
         args = build_parser().parse_args(["package", "--from", "/tmp/agent", "--out", "/tmp/out.zip"])
@@ -79,7 +96,12 @@ class CliParserTests(unittest.TestCase):
     def test_run_id_is_accepted_positionally_or_by_flag(self) -> None:
         self.assertEqual(build_parser().parse_args(["start", "run-1"]).run, "run-1")
         self.assertEqual(resolve_run_id(build_parser().parse_args(["start", "--run-id", "run-1"])).run, "run-1")
-        self.assertEqual(build_parser().parse_args(["status"]).run, None)
+        self.assertEqual(build_parser().parse_args(["status"]).run, [])
+        self.assertEqual(
+            resolve_run_id(build_parser().parse_args(["status", "--run-id", "run-1"])).run,
+            ["run-1"],
+        )
+        self.assertEqual(build_parser().parse_args(["wait", "run-1", "run-2"]).run, ["run-1", "run-2"])
 
     def test_tasks_takes_an_optional_competition(self) -> None:
         self.assertIsNone(build_parser().parse_args(["tasks"]).competition)

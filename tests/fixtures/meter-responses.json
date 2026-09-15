@@ -1,0 +1,199 @@
+{
+  "_source": "Real responses from https://meter.arc-bench.com, captured 2026-09-15 with an access-key login. Account identifiers and the key id are replaced, and the usage and requests lists are trimmed to a few rows; amounts, token counts, currencies, timestamps, cookie name and price table are as returned.",
+  "login": {
+    "account": {
+      "access_key_id": "redacted-access-key-id",
+      "account_id": "account@example.com",
+      "route_policy_id": "",
+      "subject_id": "account@example.com",
+      "subject_type": "email"
+    },
+    "expires_at": "2026-09-15T23:05:08+08:00",
+    "ok": true
+  },
+  "login_rejected": {
+    "error": "invalid access key",
+    "ok": false
+  },
+  "set_cookie": "onr_user_session=redacted-session; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax",
+  "me": {
+    "account": {
+      "access_key_id": "redacted-access-key-id",
+      "account_id": "account@example.com",
+      "route_policy_id": "",
+      "subject_id": "account@example.com",
+      "subject_type": "email"
+    },
+    "ok": true
+  },
+  "balance": {
+    "balance": {
+      "account_id": "account@example.com",
+      "currency": "CNY",
+      "balance": "-1.353979",
+      "available_balance": "-1.353979"
+    },
+    "currency": "CNY",
+    "ok": true
+  },
+  "freshness": {
+    "as_of": "2026-09-15T03:05:11Z",
+    "eventual_consistency": true,
+    "ok": true,
+    "pending_billing_events": 0
+  },
+  "models": {
+    "models": [
+      {
+        "available": true,
+        "id": "deepseek-v4-flash",
+        "pricing": {
+          "input": "3",
+          "output": "9",
+          "cache_hit": "0.1",
+          "billing": "TOKENS",
+          "unit": "CNY / 1M tokens",
+          "source": "public"
+        },
+        "provider": "DeepSeek"
+      },
+      {
+        "available": true,
+        "id": "deepseek-v4-pro",
+        "pricing": {
+          "input": "9",
+          "output": "27",
+          "cache_hit": "0.3",
+          "billing": "TOKENS",
+          "unit": "CNY / 1M tokens",
+          "source": "public"
+        },
+        "provider": "DeepSeek"
+      },
+      {
+        "available": true,
+        "id": "glm-5.3-flash",
+        "pricing": {
+          "input": "0.8",
+          "output": "2.8",
+          "cache_hit": "0.23",
+          "billing": "TOKENS",
+          "unit": "CNY / 1M tokens",
+          "source": "public"
+        },
+        "provider": "Z.AI"
+      }
+    ],
+    "ok": true
+  },
+  "usage": {
+    "bucket_size": "1h",
+    "currency": "CNY",
+    "end": 1789442968,
+    "ok": true,
+    "rows": [
+      {
+        "dimensions": {
+          "bucket": "2026-09-14T03:00:00+00:00",
+          "model": "deepseek-v4-flash"
+        },
+        "measures": {
+          "amount": "1.404476",
+          "cached_tokens": 40960,
+          "completion_tokens": 127307,
+          "prompt_tokens": 125832,
+          "quantity": 253139,
+          "usage_event_count": 7
+        }
+      },
+      {
+        "dimensions": {
+          "bucket": "2026-09-14T04:00:00+00:00",
+          "model": "deepseek-v4-flash"
+        },
+        "measures": {
+          "amount": "3.202565",
+          "cached_tokens": 292352,
+          "completion_tokens": 225670,
+          "prompt_tokens": 673118,
+          "quantity": 898788,
+          "usage_event_count": 71
+        }
+      },
+      {
+        "dimensions": {
+          "bucket": "2026-09-14T04:00:00+00:00",
+          "model": "kimi-k3"
+        },
+        "measures": {
+          "amount": "0.266640",
+          "cached_tokens": 0,
+          "completion_tokens": 1195,
+          "prompt_tokens": 7357,
+          "quantity": 8552,
+          "usage_event_count": 1
+        }
+      },
+      {
+        "dimensions": {
+          "bucket": "2026-09-15T02:00:00+00:00",
+          "model": "deepseek-v4-flash"
+        },
+        "measures": {
+          "amount": "35.183570",
+          "cached_tokens": 22435328,
+          "completion_tokens": 2157007,
+          "prompt_tokens": 26944316,
+          "quantity": 29101323,
+          "usage_event_count": 1040
+        }
+      }
+    ]
+  },
+  "requests": {
+    "currency": "CNY",
+    "end": 1789442971,
+    "ok": true,
+    "requests": [
+      {
+        "metrics": {
+          "amount": "0.284180",
+          "cached_tokens": 0,
+          "currency": "CNY",
+          "input_tokens": 7349,
+          "output_tokens": 1372,
+          "total_tokens": 8721
+        },
+        "model": "kimi-k3",
+        "occurred_at": 1789355813,
+        "request_id": "2026091411155347694733883826"
+      },
+      {
+        "metrics": {
+          "amount": "0.267541",
+          "cached_tokens": 2048,
+          "currency": "CNY",
+          "input_tokens": 9410,
+          "output_tokens": 27250,
+          "total_tokens": 36660
+        },
+        "model": "deepseek-v4-flash",
+        "occurred_at": 1789357041,
+        "request_id": "2026091411342407200837985435"
+      },
+      {
+        "metrics": {
+          "amount": "0.472253",
+          "cached_tokens": 4096,
+          "currency": "CNY",
+          "input_tokens": 30604,
+          "output_tokens": 43591,
+          "total_tokens": 74195
+        },
+        "model": "deepseek-v4-flash",
+        "occurred_at": 1789441409,
+        "request_id": "2026091510583767756231956632"
+      }
+    ]
+  }
+}
