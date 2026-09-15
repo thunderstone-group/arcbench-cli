@@ -37,6 +37,12 @@ from arcbench_cli.cli import main
 SESSION_VALUE = "synthetic-session-secret"
 MODEL_KEY = "synthetic-model-secret"
 
+# Meter payloads are the live service's own responses with the account
+# identifiers removed; see the file's own `_source` note.
+METER = json.loads(
+    (Path(__file__).parent / "fixtures/meter-responses.json").read_text(encoding="utf-8")
+)
+
 
 class Website:
     """A minimal stand-in for the platform's HTTP surface."""
@@ -47,10 +53,13 @@ class Website:
         self.download_failure = False
         self.create_failure = False
         self.start_failure = False
+        self.start_failures: set[str] = set()
         self.reject_auth = False
         self.mismatch = False
         self.redirect: str | None = None
         self.run_states = ["PASSED"]
+        self.states: dict[str, list[str]] = {}
+        self.created_runs = 0
         self.truncate_responses = 0
         owner = self
 
@@ -80,6 +89,7 @@ class Website:
                     self.end_headers()
                     return
                 status, result, mime = 200, {}, "application/json"
+                extra_headers: list[tuple[str, str]] = []
                 path = self.path
                 if path == "/api/auth/me":
                     status, result = (
@@ -87,12 +97,26 @@ class Website:
                         if owner.reject_auth
                         else (200, {"user": {"username": "synthetic-user"}})
                     )
+                elif path == "/api/user/login":
+                    if json.loads(raw or b"{}").get("access_key") == MODEL_KEY:
+                        result = METER["login"]
+                        extra_headers.append(("Set-Cookie", METER["set_cookie"]))
+                    else:
+                        status, result = 401, METER["login_rejected"]
                 elif path == "/api/user/me":
-                    result = {"account": {"account_id": "synthetic-meter-account-id"}}
+                    result = METER["me"]
                 elif path == "/api/user/balance":
-                    result = {"balance": {"available_balance": "0.000000"}, "currency": "CNY"}
+                    result = METER["balance"]
                 elif path == "/api/user/freshness":
-                    result = {"as_of": "2026-09-11T08:52:24Z", "pending_billing_events": 0}
+                    result = METER["freshness"]
+                elif path == "/api/user/models":
+                    result = METER["models"]
+                elif path == "/api/competitions/sample":
+                    result = {
+                        "id": "sample",
+                        "title": "Sample competition",
+                        "tasks": [{"id": "sample--a"}, {"id": "sample--b"}],
+                    }
                 elif path == "/api/auth/access-key":
                     result = {"api_key": MODEL_KEY}
                 elif path.startswith("/api/competitions/leaderboard?"):
@@ -112,35 +136,46 @@ class Website:
                     else:
                         mime, result = "application/zip", b"wrong" if owner.mismatch else owner.archive
                 elif path == "/api/runs":
+                    owner.created_runs += 1
                     status, result = (
                         (409, {"detail": "The submitted agent archive is no longer available"})
                         if owner.create_failure
-                        else (200, {"run": {"id": "run-1", "status": "PENDING"}})
+                        else (
+                            200,
+                            {"run": {"id": f"run-{owner.created_runs}", "status": "PENDING"}},
+                        )
                     )
-                elif path == "/api/runs/run-1/start":
-                    status, result = (
-                        (503, {"detail": "upstream unavailable"})
-                        if owner.start_failure
-                        else (200, {"id": "run-1", "status": "RUNNING"})
-                    )
-                elif path == "/api/runs/run-1/cancel":
-                    owner.run_states = ["CANCELLED"]
-                    status, result = 500, {"detail": "Internal Server Error"}
-                elif path == "/api/runs/run-1":
-                    result = {"id": "run-1", "status": owner.run_states[0]}
-                    if len(owner.run_states) > 1:
-                        owner.run_states.pop(0)
-                elif path.startswith("/api/runs/run-1/logs"):
-                    result = {"console": f"line-1\nkey {MODEL_KEY}\nline-3", "log_offset": 42}
-                elif path.startswith("/api/runs/run-1/source?"):
-                    result = {
-                        "file_path": ".agent/trace.jsonl",
-                        "kind": "file",
-                        "content": f"safe\n{MODEL_KEY}",
-                    }
+                elif path.startswith("/api/runs/"):
+                    run_id, _, action = path[len("/api/runs/") :].partition("/")
+                    action = action.split("?")[0]
+                    states = owner.states.get(run_id, owner.run_states)
+                    if action == "start":
+                        failed = owner.start_failure or run_id in owner.start_failures
+                        status, result = (
+                            (503, {"detail": "upstream unavailable"})
+                            if failed
+                            else (200, {"id": run_id, "status": "RUNNING"})
+                        )
+                    elif action == "cancel":
+                        owner.run_states = ["CANCELLED"]
+                        status, result = 500, {"detail": "Internal Server Error"}
+                    elif action == "logs":
+                        result = {"console": f"line-1\nkey {MODEL_KEY}\nline-3", "log_offset": 42}
+                    elif action == "source":
+                        result = {
+                            "file_path": ".agent/trace.jsonl",
+                            "kind": "file",
+                            "content": f"safe\n{MODEL_KEY}",
+                        }
+                    else:
+                        result = {"id": run_id, "status": states[0]}
+                        if len(states) > 1:
+                            states.pop(0)
                 body = result if isinstance(result, bytes) else json.dumps(result).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", mime)
+                for name, value in extra_headers:
+                    self.send_header(name, value)
                 truncated = owner.truncate_responses > 0
                 if truncated:
                     owner.truncate_responses -= 1
@@ -205,11 +240,14 @@ class PlatformTests(unittest.TestCase):
     def client(self, server: Website, **overrides) -> OfficialClient:
         return OfficialClient(self.config(server, **overrides))
 
-    def run_cli(self, server: Website, *argv: str) -> tuple[int, str]:
+    def run_cli(self, server: Website, *argv: str, env_lines: list[str] | None = None) -> tuple[int, str]:
+        if env_lines is None:
+            env_lines = [
+                f"ARC_BENCH_SESSION_COOKIE=arcbench_session={SESSION_VALUE}",
+                f"ARC_BENCH_METER_COOKIE=arcbench_session={SESSION_VALUE}",
+            ]
         self.env_file.write_text(
-            f"ARC_BENCH_SESSION_COOKIE=arcbench_session={SESSION_VALUE}\n"
-            f"ARC_BENCH_METER_COOKIE=arcbench_session={SESSION_VALUE}\n"
-            f"ARC_BENCH_METER_BASE_URL={server.origin}\n",
+            "\n".join([*env_lines, f"ARC_BENCH_METER_BASE_URL={server.origin}"]) + "\n",
             encoding="utf-8",
         )
         output = io.StringIO()
@@ -340,7 +378,7 @@ class PlatformTests(unittest.TestCase):
             server.start_failure = True
             code, output = self.run_cli(server, "run", "submission-1", "--task", "sample--a")
             self.assertEqual(code, 1)
-            record = json.loads(output)
+            record = json.loads(output)[0]
             self.assertEqual(record["run_id"], "run-1")
             self.assertTrue(record["start_error"]["outcome_uncertain"])
             self.assertEqual(
@@ -389,6 +427,108 @@ class PlatformTests(unittest.TestCase):
             self.assertFalse(last["run_cancelled"])
             self.assertFalse(any(item["method"] == "POST" for item in server.requests))
 
+    # --- concurrency -----------------------------------------------------
+
+    def test_run_starts_one_run_per_task_and_reports_each(self) -> None:
+        with Website() as server:
+            code, output = self.run_cli(
+                server, "run", "submission-1", "--task", "sample--a", "--task", "sample--b"
+            )
+            self.assertEqual(code, 0)
+            records = json.loads(output)
+            self.assertEqual(
+                [(item["task"], item["run_id"], item["run"]["status"]) for item in records],
+                [("sample--a", "run-1", "RUNNING"), ("sample--b", "run-2", "RUNNING")],
+            )
+            self.assertEqual(
+                [item["path"] for item in server.requests if item["method"] == "POST"],
+                ["/api/runs", "/api/runs/run-1/start", "/api/runs", "/api/runs/run-2/start"],
+            )
+
+    def test_one_failed_start_does_not_stop_the_remaining_tasks(self) -> None:
+        with Website() as server:
+            server.start_failures = {"run-1"}
+            code, output = self.run_cli(
+                server, "run", "submission-1", "--task", "sample--a", "--task", "sample--b"
+            )
+            self.assertEqual(code, 1)
+            failed, started = json.loads(output)
+            self.assertEqual(failed["run_id"], "run-1")
+            self.assertTrue(failed["start_error"]["outcome_uncertain"])
+            self.assertIn("arcbench start run-1", failed["next"])
+            self.assertEqual(started["run"]["status"], "RUNNING")
+
+    def test_all_tasks_resolves_the_competition_from_the_submission(self) -> None:
+        with Website() as server:
+            code, output = self.run_cli(server, "run", "submission-1", "--all-tasks")
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                [item["task"] for item in json.loads(output)], ["sample--a", "sample--b"]
+            )
+            gets = [item["path"] for item in server.requests if item["method"] == "GET"]
+            self.assertEqual(gets[:2], ["/api/submissions", "/api/competitions/sample"])
+
+    def test_all_tasks_on_an_unknown_submission_starts_nothing(self) -> None:
+        with Website() as server:
+            code, _ = self.run_cli(server, "run", "submission-404", "--all-tasks")
+            self.assertEqual(code, 1)
+            self.assertFalse(any(item["method"] == "POST" for item in server.requests))
+
+    def test_run_without_a_task_selection_starts_nothing(self) -> None:
+        with Website() as server:
+            self.assertEqual(self.run_cli(server, "run", "submission-1")[0], 1)
+            self.assertFalse(any(item["method"] == "POST" for item in server.requests))
+
+    def test_wait_polls_several_runs_round_robin_until_all_finish(self) -> None:
+        with Website() as server:
+            server.states = {"run-1": ["RUNNING", "PASSED"], "run-2": ["QUEUED", "RUNNING", "PASSED"]}
+            code, output = self.run_cli(
+                server, "wait", "run-1", "run-2", "--interval", "0.001", "--timeout", "5"
+            )
+            self.assertEqual(code, 0)
+            rows = [json.loads(line) for line in output.splitlines()]
+            self.assertEqual(
+                [(row["run_id"], row["status"]) for row in rows],
+                [
+                    ("run-1", "RUNNING"),
+                    ("run-2", "QUEUED"),
+                    ("run-1", "PASSED"),
+                    ("run-2", "RUNNING"),
+                    ("run-2", "PASSED"),
+                ],
+            )
+            self.assertFalse(any(item["method"] == "POST" for item in server.requests))
+
+    def test_wait_on_several_runs_reports_a_non_passing_one(self) -> None:
+        with Website() as server:
+            server.states = {"run-1": ["PASSED"], "run-2": ["FAILED"]}
+            code, _ = self.run_cli(
+                server, "wait", "run-1", "run-2", "--interval", "0.001", "--timeout", "5"
+            )
+            self.assertEqual(code, 1)
+
+    def test_wait_on_several_runs_reports_the_deadline_per_run(self) -> None:
+        with Website() as server:
+            server.states = {"run-1": ["PASSED"], "run-2": ["RUNNING"]}
+            code, output = self.run_cli(
+                server, "wait", "run-1", "run-2", "--interval", "0.01", "--timeout", "0.05"
+            )
+            self.assertEqual(code, 2)
+            last = json.loads(output.splitlines()[-1])
+            self.assertEqual(last["run_id"], "run-2")
+            self.assertTrue(last["waiting_timed_out"])
+            self.assertFalse(last["run_cancelled"])
+
+    def test_status_reads_several_runs_one_record_each(self) -> None:
+        with Website() as server:
+            server.states = {"run-1": ["PASSED"], "run-2": ["FAILED"]}
+            code, output = self.run_cli(server, "status", "run-1", "run-2")
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                [json.loads(line)["status"] for line in output.splitlines()],
+                ["PASSED", "FAILED"],
+            )
+
     # --- redaction and rendering ----------------------------------------
 
     def test_source_reads_one_file_and_saves_it_redacted_and_private(self) -> None:
@@ -413,30 +553,83 @@ class PlatformTests(unittest.TestCase):
             self.assertIn("***", record["console"])
             self.assertEqual(record["next_offset"], 42)
 
-    def test_meter_uses_its_own_route_and_preserves_a_decimal_balance(self) -> None:
-        # Route and field shapes were verified against the live meter; amounts are synthetic.
+    def test_meter_cookie_still_overrides_the_key_login(self) -> None:
+        # Routes and field shapes come from the live meter; see the fixture.
         with Website() as server:
             code, output = self.run_cli(server, "balance")
             self.assertEqual(code, 0)
             self.assertEqual(
                 json.loads(output),
                 {
-                    "available_balance": "0.000000",
+                    "account": "acco....com",
+                    "available_balance": "-1.353979",
                     "currency": "CNY",
-                    "as_of": "2026-09-11T08:52:24Z",
+                    "as_of": "2026-09-15T03:05:11Z",
                     "pending_billing_events": 0,
                 },
             )
+            # A configured cookie means no login request is made at all.
             self.assertEqual(
                 [item["path"] for item in server.requests],
                 ["/api/user/balance", "/api/user/freshness"],
             )
 
+    def test_meter_logs_in_with_the_access_key_and_holds_the_cookie(self) -> None:
+        with Website() as server:
+            code, output = self.run_cli(
+                server, "balance", env_lines=[f"ARC_BENCH_API_KEY={MODEL_KEY}"]
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output)["available_balance"], "-1.353979")
+            self.assertEqual(
+                [item["path"] for item in server.requests],
+                ["/api/user/login", "/api/user/balance", "/api/user/freshness"],
+            )
+            login, balance = server.requests[0], server.requests[1]
+            self.assertEqual(login["method"], "POST")
+            self.assertIsNone(login["cookie"])
+            self.assertIn("onr_user_session=redacted-session", balance["cookie"])
+            self.assertNotIn(MODEL_KEY, output)
+
+    def test_meter_falls_back_to_the_account_key_when_none_is_configured(self) -> None:
+        with Website() as server:
+            code, _ = self.run_cli(
+                server,
+                "balance",
+                env_lines=[f"ARC_BENCH_SESSION_COOKIE=arcbench_session={SESSION_VALUE}"],
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                [item["path"] for item in server.requests][:2],
+                ["/api/auth/access-key", "/api/user/login"],
+            )
+
+    def test_meter_login_failure_reports_without_echoing_the_key(self) -> None:
+        with Website() as server:
+            code, output = self.run_cli(
+                server, "balance", env_lines=["ARC_BENCH_API_KEY=wrong-key-value"]
+            )
+            self.assertEqual(code, 1)
+            self.assertNotIn("wrong-key-value", output)
+            self.assertEqual([item["path"] for item in server.requests], ["/api/user/login"])
+
+    def test_models_prints_the_gateway_price_table(self) -> None:
+        with Website() as server:
+            code, output = self.run_cli(
+                server, "models", env_lines=[f"ARC_BENCH_API_KEY={MODEL_KEY}"]
+            )
+            self.assertEqual(code, 0)
+            models = json.loads(output)
+            self.assertEqual([model["id"] for model in models][:2],
+                             ["deepseek-v4-flash", "deepseek-v4-pro"])
+            self.assertEqual(models[0]["pricing"]["unit"], "CNY / 1M tokens")
+            self.assertEqual(server.requests[-1]["path"], "/api/user/models")
+
     def test_meter_identifier_is_not_printed_in_full(self) -> None:
         with Website() as server:
             code, output = self.run_cli(server, "whoami", "--meter")
             self.assertEqual(code, 0)
-            self.assertNotIn("synthetic-meter-account-id", output)
+            self.assertNotIn("account@example.com", output)
             self.assertEqual(server.requests[-1]["path"], "/api/user/me")
 
     def test_status_full_response_is_redacted(self) -> None:
