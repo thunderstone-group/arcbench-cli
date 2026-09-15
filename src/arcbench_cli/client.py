@@ -47,6 +47,7 @@ DEFAULT_RETRY_AFTER = 30.0
 DEFAULT_POLL_TOLERANCE = 2
 
 SESSION_COOKIE = "arcbench_session"
+METER_SESSION_COOKIE = "onr_user_session"
 
 TERMINAL_STATES = {"PASSED", "FAILED", "ERROR", "CANCELLED", "CANCELED", "TIMEOUT", "PAUSED"}
 
@@ -400,12 +401,16 @@ class SubmitConfig:
     def for_meter(self) -> "SubmitConfig":
         """Return a configuration bound to the separate metering service.
 
-        The two services never see each other's cookies.
+        The two services never see each other's cookies. The metering service
+        accepts the gateway access key as a login credential, so the key rides
+        along; a browser cookie is only needed when one is configured as an
+        override.
         """
         return SubmitConfig(
             base_url=self.meter_base_url,
             meter_base_url=self.meter_base_url,
             session_cookie=self.meter_cookie,
+            api_key=self.api_key,
             timeout_seconds=self.timeout_seconds,
             auth_path="/api/user/me",
         )
@@ -511,7 +516,7 @@ class OfficialClient:
         content_type: str | None = None,
     ) -> tuple[int, Any]:
         """Perform one request. Never retries, for any method."""
-        headers = {"Accept": "application/json", "User-Agent": "arcbench-cli/0.2"}
+        headers = {"Accept": "application/json", "User-Agent": "arcbench-cli/0.3"}
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         if data is not None and content_type:
             request.add_header("Content-Type", content_type)
@@ -578,7 +583,8 @@ class OfficialClient:
     # --- reads -----------------------------------------------------------
 
     def check_login(self) -> dict[str, Any]:
-        if not self.config.session_cookie:
+        # A cookie can come from configuration or from an access-key login.
+        if not self.config.session_cookie and not len(self.cookies):
             return {"logged_in": False, "reason": "session cookie is not configured"}
         status, payload = self._request("GET", f"{self.config.base_url}{self.config.auth_path}")
         result: dict[str, Any] = {"logged_in": 200 <= status < 300, "http_status": status}
@@ -623,6 +629,40 @@ class OfficialClient:
             for item in items
             if not competition_id or item.get("competition_id") == competition_id
         ]
+
+    def get_submission(self, submission_id: str) -> dict[str, Any]:
+        """Find one saved submission in the account's list.
+
+        The platform publishes no single-submission route, so the list is the
+        only way to learn which competition a submission belongs to.
+        """
+        for item in self.list_submissions():
+            if str(item.get("id")) == str(submission_id):
+                return item
+        raise ApiError(
+            f"submission {submission_id} is not in this account's submissions",
+            method="GET",
+            path="/submissions",
+        )
+
+    def tasks_for_submission(self, submission_id: str) -> list[str]:
+        """Return every task id of the competition a submission was saved for."""
+        competition_id = self.get_submission(submission_id).get("competition_id")
+        if not competition_id:
+            raise ApiError(
+                f"submission {submission_id} names no competition, so its tasks "
+                "cannot be resolved; pass --task instead",
+                method="GET",
+                path="/submissions",
+            )
+        tasks = [str(task.get("id")) for task in self.list_tasks(str(competition_id)) if task.get("id")]
+        if not tasks:
+            raise ApiError(
+                f"competition {competition_id} publishes no tasks",
+                method="GET",
+                path=f"/competitions/{competition_id}",
+            )
+        return tasks
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         payload = self.request("GET", f"/runs/{quote(run_id)}")
@@ -679,6 +719,28 @@ class OfficialClient:
             ranked = [row for row in ranked if row.get("username") == team]
         return ranked[:limit]
 
+    def meter_login(self, access_key: str) -> dict[str, Any]:
+        """Exchange the gateway access key for a metering session cookie.
+
+        The metering site accepts the same key the CLI sends to the model
+        gateway, so reading a balance needs no browser cookie. The key is
+        registered for redaction before it is sent, and the cookie the server
+        returns is held in the jar for the life of the process.
+        """
+        if not access_key:
+            raise ValueError("meter login needs the gateway access key")
+        self.known_secrets.append(access_key)
+        body = json.dumps({"access_key": access_key}).encode("utf-8")
+        payload = self.request("POST", "/user/login", body, "application/json")
+        if not any(cookie.name == METER_SESSION_COOKIE for cookie in self.cookies):
+            raise ApiError(
+                f"meter login set no {METER_SESSION_COOKIE} cookie",
+                method="POST",
+                path="/user/login",
+            )
+        account = payload.get("account") if isinstance(payload, dict) else None
+        return account if isinstance(account, dict) else {}
+
     def balance(self) -> dict[str, Any]:
         """Read the metering dashboard's balance and billing freshness."""
         balance = self.request("GET", "/user/balance")
@@ -686,13 +748,21 @@ class OfficialClient:
         freshness = self.request("GET", "/user/freshness")
         freshness = freshness if isinstance(freshness, dict) else {}
         return {
-            # Decimal amounts stay strings; a zero balance is not missing.
+            "account": redact(str(snapshot.get("account_id", "")) or None),
+            # Decimal amounts stay strings; a zero balance is not missing, and
+            # a negative one is a legal value the meter really returns.
             "available_balance": snapshot.get("available_balance", snapshot.get("balance")),
             "currency": (balance.get("currency") if isinstance(balance, dict) else None)
             or snapshot.get("currency"),
             "as_of": freshness.get("as_of"),
             "pending_billing_events": freshness.get("pending_billing_events"),
         }
+
+    def models(self) -> list[dict[str, Any]]:
+        """Read the gateway's model catalogue and its published prices."""
+        payload = self.request("GET", "/user/models")
+        models = payload.get("models") if isinstance(payload, dict) else payload
+        return models if isinstance(models, list) else []
 
     def download_submission_archive(self, submission_id: str) -> bytes:
         return self.binary(f"/submissions/{quote(submission_id)}/archive")
@@ -846,6 +916,71 @@ class OfficialClient:
                     on_wait(attempts, retry_after, delay, error.status, error.payload)
                 time.sleep(delay)
 
+    def poll_runs(
+        self,
+        run_ids: list[str],
+        interval: float = 5.0,
+        timeout: float = 1800.0,
+        on_tick=None,
+        tolerate_failures: int = DEFAULT_POLL_TOLERANCE,
+        on_retry=None,
+    ) -> list[dict[str, Any]]:
+        """Poll several runs round-robin to terminal states, or to the deadline.
+
+        The platform runs tasks and submissions concurrently, so waiting on one
+        run at a time is a needless serialisation. One sweep reads every run
+        that has not finished, then the loop sleeps once; results come back in
+        the order the ids were given.
+
+        Transport failures and 5xx replies are tolerated up to
+        ``tolerate_failures`` consecutively **per run**, then re-raised: an
+        observed run closed its response mid-body, and a partial read must never
+        be reported as a result. Timing out locally cancels nothing.
+        """
+        if interval <= 0 or timeout <= 0:
+            raise ValueError("poll timeout and interval must be positive")
+        ordered = list(dict.fromkeys(str(run_id) for run_id in run_ids))
+        if not ordered:
+            raise ValueError("poll needs at least one run id")
+        deadline = time.monotonic() + timeout
+        pending = list(ordered)
+        failures = dict.fromkeys(ordered, 0)
+        last: dict[str, dict[str, Any]] = {run_id: {} for run_id in ordered}
+        results: dict[str, dict[str, Any]] = {}
+        while pending:
+            for run_id in list(pending):
+                try:
+                    current = self.get_run(run_id)
+                except ApiError as error:
+                    failures[run_id] += 1
+                    recoverable = error.transport or (error.status or 0) >= 500
+                    if failures[run_id] > tolerate_failures or not recoverable:
+                        raise
+                    if on_retry:
+                        on_retry(run_id, failures[run_id], error)
+                    continue
+                failures[run_id] = 0
+                last[run_id] = current
+                if on_tick:
+                    on_tick(run_id, current)
+                if str(current.get("status", "")).upper() in TERMINAL_STATES:
+                    results[run_id] = current
+                    pending.remove(run_id)
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                for run_id in pending:
+                    results[run_id] = {
+                        "id": run_id,
+                        "status": None,
+                        **last[run_id],
+                        "poll_timed_out": True,
+                    }
+                break
+            time.sleep(min(interval, remaining))
+        return [results[run_id] for run_id in ordered]
+
     def poll_run(
         self,
         run_id: str,
@@ -855,43 +990,15 @@ class OfficialClient:
         tolerate_failures: int = DEFAULT_POLL_TOLERANCE,
         on_retry=None,
     ) -> dict[str, Any]:
-        """Poll one run to a terminal state, or to the local deadline.
-
-        Transport failures and 5xx replies are tolerated up to
-        ``tolerate_failures`` consecutively, then re-raised: an observed run
-        closed its response mid-body, and a partial read must never be reported
-        as a result. Timing out locally does not cancel the remote run.
-        """
-        if interval <= 0 or timeout <= 0:
-            raise ValueError("poll timeout and interval must be positive")
-        deadline = time.monotonic() + timeout
-        failures = 0
-        last: dict[str, Any] = {}
-        while True:
-            try:
-                last = self.get_run(run_id)
-            except ApiError as error:
-                failures += 1
-                recoverable = error.transport or (error.status or 0) >= 500
-                if failures > tolerate_failures or not recoverable:
-                    raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return {"id": run_id, "status": last.get("status"), "poll_timed_out": True}
-                if on_retry:
-                    on_retry(failures, error)
-                time.sleep(min(interval, remaining))
-                continue
-            failures = 0
-            if on_tick:
-                on_tick(last)
-            if str(last.get("status", "")).upper() in TERMINAL_STATES:
-                return last
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                last["poll_timed_out"] = True
-                return last
-            time.sleep(min(interval, remaining))
+        """Poll one run to a terminal state, or to the local deadline."""
+        return self.poll_runs(
+            [run_id],
+            interval,
+            timeout,
+            on_tick=(lambda _run_id, run: on_tick(run)) if on_tick else None,
+            tolerate_failures=tolerate_failures,
+            on_retry=(lambda _run_id, attempt, error: on_retry(attempt, error)) if on_retry else None,
+        )[0]
 
 
 def quote(value: str) -> str:
@@ -983,13 +1090,25 @@ def log_summary(run_id: str, payload: dict[str, Any], tail: int) -> dict[str, An
 
 
 def enforce_budget(record_dir: Path, config: SubmitConfig, dry_run: bool = False) -> None:
-    """Cap how many real submissions one machine can create, and pace them."""
+    """Cap how many real submissions one machine can create, and pace them.
+
+    One submission can be run against many tasks and leaves one record per
+    task, so the budget counts distinct submissions rather than record files.
+    """
     records = sorted(record_dir.glob("*.json")) if record_dir.exists() else []
     if dry_run:
         return
-    if len(records) >= config.max_submissions:
+    submissions = set()
+    for item in records:
+        try:
+            saved = json.loads(item.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = {}
+        identifier = saved.get("submission_id") if isinstance(saved, dict) else None
+        submissions.add(identifier or item.name)
+    if len(submissions) >= config.max_submissions:
         raise RuntimeError(
-            f"submission budget exhausted: {len(records)}/{config.max_submissions}"
+            f"submission budget exhausted: {len(submissions)}/{config.max_submissions}"
         )
     if records:
         newest = max(item.stat().st_mtime for item in records)

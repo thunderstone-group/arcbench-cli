@@ -76,17 +76,37 @@ def _config(args: argparse.Namespace) -> tuple[dict[str, str], SubmitConfig]:
     return env, config
 
 
-def _client(args: argparse.Namespace, meter: bool = False) -> tuple[dict[str, str], OfficialClient]:
+def _client(args: argparse.Namespace) -> tuple[dict[str, str], OfficialClient]:
     env, config = _config(args)
-    if meter:
-        config = config.for_meter()
-        if not config.session_cookie:
-            raise CliError(
-                "ARC_BENCH_METER_COOKIE is not configured; the metering site has its own login"
-            )
-    elif not config.session_cookie:
+    if not config.session_cookie:
         raise CliError("ARC_BENCH_SESSION_COOKIE is not configured; run `arcbench session`")
     return env, OfficialClient(config)
+
+
+def _meter_client(args: argparse.Namespace) -> tuple[dict[str, str], OfficialClient]:
+    """Open a metering session, preferring the gateway key over a cookie.
+
+    The metering site accepts the same access key the CLI hands to the model
+    gateway, so no browser cookie is needed. ``ARC_BENCH_METER_COOKIE`` still
+    wins when it is set, for an account whose key is not at hand.
+    """
+    env, config = _config(args)
+    meter = config.for_meter()
+    client = OfficialClient(meter)
+    if meter.session_cookie:
+        return env, client
+    key = meter.api_key
+    if not key:
+        if not config.session_cookie:
+            raise CliError(
+                "no metering credential: set ARC_BENCH_API_KEY, or a website session "
+                "(`arcbench session`) so the account key can be read, or ARC_BENCH_METER_COOKIE"
+            )
+        key = OfficialClient(config).access_key()
+    if not key:
+        raise CliError("the account has no gateway access key to log in to the meter with")
+    client.meter_login(key)
+    return env, client
 
 
 def _default_record_dir(env: dict[str, str]) -> Path:
@@ -127,10 +147,33 @@ def _on_queue_wait(attempt: int, retry_after: float, delay: float, status: int, 
     )
 
 
-def _terminal_exit_code(run: dict[str, Any]) -> int:
-    if run.get("poll_timed_out"):
-        return 2
-    return 0 if str(run.get("status", "")).upper() == "PASSED" else 1
+def _terminal_exit_code(runs: list[dict[str, Any]]) -> int:
+    """Reduce one or many observed runs to one exit code.
+
+    A run that reached a non-passing terminal state is definite, so it outranks
+    a local deadline, which says nothing about the run at all.
+    """
+    finished = [run for run in runs if not run.get("poll_timed_out")]
+    if any(str(run.get("status", "")).upper() != "PASSED" for run in finished):
+        return 1
+    return 2 if len(finished) < len(runs) else 0
+
+
+def _resolve_tasks(
+    client: OfficialClient,
+    submission_id: str,
+    tasks: list[str] | None,
+    all_tasks: bool,
+) -> list[str]:
+    """Settle on the task list, from repeated --task or from the competition."""
+    resolved = (
+        client.tasks_for_submission(submission_id)
+        if all_tasks
+        else [str(task) for task in (tasks or [])]
+    )
+    if not resolved:
+        raise CliError("choose what to run: --task TASK (repeatable) or --all-tasks")
+    return list(dict.fromkeys(resolved))
 
 
 # --- credentials ---------------------------------------------------------
@@ -145,23 +188,48 @@ def cmd_session(args: argparse.Namespace) -> int:
 
 
 def cmd_whoami(args: argparse.Namespace) -> int:
-    _, client = _client(args, meter=args.meter)
+    _, client = _meter_client(args) if args.meter else _client(args)
     result = client.check_login()
-    emit(args, result, [f"logged_in={result.get('logged_in')} user={result.get('username')}"])
+    emit(
+        args,
+        result,
+        [
+            f"logged_in={result.get('logged_in')} "
+            f"user={result.get('username') or result.get('account')}"
+        ],
+    )
     return 0 if result.get("logged_in") else 2
 
 
 def cmd_balance(args: argparse.Namespace) -> int:
-    _, client = _client(args, meter=True)
+    _, client = _meter_client(args)
     result = client.balance()
     emit(
         args,
         result,
         [
-            f"balance={result['available_balance']} {result['currency'] or ''} "
-            f"as_of={result['as_of']} pending={result['pending_billing_events']}"
+            f"account={result['account']} balance={result['available_balance']} "
+            f"{result['currency'] or ''} as_of={result['as_of']} "
+            f"pending={result['pending_billing_events']}"
         ],
     )
+    return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """Print the gateway's price table, as the metering site publishes it."""
+    _, client = _meter_client(args)
+    models = client.models()
+    lines = []
+    for model in models:
+        pricing = model.get("pricing") or {}
+        lines.append(
+            f"{str(model.get('id', '-')):32s} {str(model.get('provider', '-')):12s} "
+            f"available={str(model.get('available')):5s} "
+            f"in/cache/out={pricing.get('input')}/{pricing.get('cache_hit')}/{pricing.get('output')} "
+            f"{pricing.get('unit') or ''}"
+        )
+    emit(args, models, lines)
     return 0
 
 
@@ -403,26 +471,42 @@ def cmd_upload(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Create a run, then start it. Two API calls, neither ever retried."""
+    """Create and start one run per task. Two API calls each, never retried.
+
+    The platform runs several tasks, and several submissions, at the same time,
+    so the runs are started one after another and left to overlap. A task that
+    fails to start does not stop the ones after it.
+    """
     _, client = _client(args)
-    run = client.create_run(args.submission, args.task)
-    run_id = str(run.get("id") or run.get("run_id"))
-    record: dict[str, Any] = {
-        "run_id": run_id,
-        "url": f"{client.config.base_url}/runs/{run_id}",
-    }
-    try:
-        started = client.start_run_with_queue_wait(
-            run_id, _queue_timeout(args, client.config), on_wait=_on_queue_wait
-        )
-        record["run"] = summarize_run(started)
-    except ApiError as error:
-        record["start_error"] = error.details
-        record["next"] = f"inspect the run, then use: arcbench start {run_id}"
-        emit(args, record, [f"run={run_id} created but not started: {error}"])
-        return 1
-    emit(args, record, [f"run={run_id} {record['url']}"])
-    return 0
+    tasks = _resolve_tasks(client, args.submission, args.task, args.all_tasks)
+    timeout = _queue_timeout(args, client.config)
+    records: list[dict[str, Any]] = []
+    lines: list[str] = []
+    started_all = True
+    for task in tasks:
+        record: dict[str, Any] = {"task": task}
+        run_id = ""
+        try:
+            run = client.create_run(args.submission, task)
+            run_id = str(run.get("id") or run.get("run_id"))
+            record["run_id"] = run_id
+            record["url"] = f"{client.config.base_url}/runs/{run_id}"
+            started = client.start_run_with_queue_wait(run_id, timeout, on_wait=_on_queue_wait)
+            record["run"] = summarize_run(started)
+            lines.append(f"{run_id} {task} {started.get('status')}")
+        except (ApiError, RunQueueTimeoutError) as error:
+            started_all = False
+            record["start_error"] = (
+                error.details if isinstance(error, ApiError) else {"error": str(error)}
+            )
+            if run_id:
+                record["next"] = f"inspect the run, then use: arcbench start {run_id}"
+                lines.append(f"{run_id} {task} created but not started: {error}")
+            else:
+                lines.append(f"- {task} not created: {error}")
+        records.append(record)
+    emit(args, records, lines)
+    return 0 if started_all else 1
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -457,29 +541,31 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
+    """Wait for one run, or for several at once, polling them round-robin."""
     _, client = _client(args)
-    seen: list[str] = []
+    seen: dict[str, str] = {}
 
-    def tick(run: dict[str, Any]) -> None:
+    def tick(run_id: str, run: dict[str, Any]) -> None:
         summary = summarize_run(run)
         signature = json.dumps(summary, sort_keys=True, ensure_ascii=False)
-        if signature not in seen:
-            seen.append(signature)
-            emit(args, summary, [f"  {progress_line(run)}"])
+        if seen.get(run_id) != signature:
+            seen[run_id] = signature
+            emit(args, summary, [f"  {run_id} {progress_line(run)}"])
 
-    def retry(attempt: int, error: ApiError) -> None:
-        emit(args, {"run_id": args.run, "waiting_retry": attempt, **error.details},
-             [f"  transport failure {attempt}; re-reading: {error}"])
+    def retry(run_id: str, attempt: int, error: ApiError) -> None:
+        emit(args, {"run_id": run_id, "waiting_retry": attempt, **error.details},
+             [f"  {run_id} transport failure {attempt}; re-reading: {error}"])
 
-    run = client.poll_run(args.run, args.interval, args.timeout, on_tick=tick, on_retry=retry)
-    if run.get("poll_timed_out"):
-        emit(
-            args,
-            {"run_id": args.run, "waiting_timed_out": True, "run_cancelled": False},
-            ["waiting deadline expired; the remote run was not cancelled"],
-        )
-        return 2
-    return _terminal_exit_code(run)
+    runs = client.poll_runs(args.run, args.interval, args.timeout, on_tick=tick, on_retry=retry)
+    for run in runs:
+        if run.get("poll_timed_out"):
+            run_id = run.get("id")
+            emit(
+                args,
+                {"run_id": run_id, "waiting_timed_out": True, "run_cancelled": False},
+                [f"waiting deadline expired for {run_id}; the remote run was not cancelled"],
+            )
+    return _terminal_exit_code(runs)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -497,10 +583,13 @@ def cmd_status(args: argparse.Namespace) -> int:
             ],
         )
         return 0
-    run = client.get_run(args.run)
-    record = client.safe(run) if args.full else summarize_run(run)
-    emit(args, record, [f"result: {json.dumps(record, ensure_ascii=False)}"])
-    return _terminal_exit_code(run)
+    runs = []
+    for run_id in args.run:
+        run = client.get_run(run_id)
+        runs.append(run)
+        record = client.safe(run) if args.full else summarize_run(run)
+        emit(args, record, [f"result: {json.dumps(record, ensure_ascii=False)}"])
+    return _terminal_exit_code(runs)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -609,11 +698,20 @@ def cmd_submit(args: argparse.Namespace) -> int:
         return 2
 
     task_ids = [str(task.get("id")) for task in client.list_tasks(args.competition)]
-    if task_ids and args.task not in task_ids:
-        raise CliError(f"task {args.task!r} is not in {args.competition}: {task_ids}")
+    if args.all_tasks:
+        if not task_ids:
+            raise CliError(f"{args.competition} publishes no tasks to run")
+        tasks = task_ids
+    else:
+        tasks = list(dict.fromkeys(args.task or []))
+        if not tasks:
+            raise CliError("choose what to run: --task TASK (repeatable) or --all-tasks")
+        unknown = [task for task in tasks if task_ids and task not in task_ids]
+        if unknown:
+            raise CliError(f"tasks {unknown} are not in {args.competition}: {task_ids}")
 
     log(f"package sha256={package['sha256'][:12]}... bytes={package['bytes']}")
-    log(f"competition={args.competition} task={args.task} model={model} name={name}")
+    log(f"competition={args.competition} tasks={','.join(tasks)} model={model} name={name}")
     if args.dry_run:
         log("dry-run: nothing submitted")
         return 0
@@ -639,57 +737,67 @@ def cmd_submit(args: argparse.Namespace) -> int:
             raise CliError("submission response had no id")
         log(f"submission created: {submission_id} archive_verified={verified}")
 
-    run = client.create_run(str(submission_id), args.task)
-    run_id = str(run.get("id") or run.get("run_id"))
-    log(f"run created: {run_id}  status={run.get('status', 'PENDING')}")
+    # Every task is started before any is waited on: the platform runs them
+    # concurrently, and serialising them here would only make the batch slower.
+    started: list[tuple[str, str, dict[str, Any]]] = []
+    for task in tasks:
+        run = client.create_run(str(submission_id), task)
+        run_id = str(run.get("id") or run.get("run_id"))
+        log(f"run created: {run_id}  task={task}  status={run.get('status', 'PENDING')}")
+        run = client.start_run_with_queue_wait(
+            run_id, _queue_timeout(args, config), on_wait=_on_queue_wait
+        )
+        log(f"run started: {run_id}  {config.base_url}/runs/{run_id}")
+        started.append((task, run_id, run))
 
-    run = client.start_run_with_queue_wait(
-        run_id, _queue_timeout(args, config), on_wait=_on_queue_wait
-    )
-    log(f"run started: {run_id}  {config.base_url}/runs/{run_id}")
+    seen: dict[str, str] = {}
 
-    seen: list[str] = []
-
-    def tick(current: dict[str, Any]) -> None:
+    def tick(run_id: str, current: dict[str, Any]) -> None:
         line = progress_line(current)
-        if line not in seen:
-            seen.append(line)
-            log(f"  {line}")
+        if seen.get(run_id) != line:
+            seen[run_id] = line
+            log(f"  {run_id} {line}")
 
+    runs = [run for _, _, run in started]
     if not args.no_wait:
-        run = client.poll_run(
-            run_id,
+        runs = client.poll_runs(
+            [run_id for _, run_id, _ in started],
             args.poll_interval,
             args.poll_timeout,
             on_tick=tick,
-            on_retry=lambda attempt, error: log(f"  transport failure {attempt}; re-reading"),
+            on_retry=lambda run_id, attempt, error: log(
+                f"  {run_id} transport failure {attempt}; re-reading"
+            ),
         )
 
-    metrics = summarize_run(run)
-    record = {
-        "record_type": "competition-official",
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "submission_name": name,
-        "submission_id": submission_id,
-        "archive_verified": verified,
-        "competition": args.competition,
-        "task": args.task,
-        "model": model,
-        "package": package,
-        "metrics": metrics,
-        "run_url": f"{config.base_url}/runs/{run_id}",
-    }
-    path = _record_path(record_dir, args.competition, args.task)
-    write_record(path, record, tuple(client.known_secrets))
-    log(f"result: {json.dumps(metrics, ensure_ascii=False)}")
-    log(f"record: {path}")
-    return 0 if args.no_wait else _terminal_exit_code(run)
+    for (task, run_id, _), run in zip(started, runs):
+        metrics = summarize_run(run)
+        record = {
+            "record_type": "competition-official",
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "submission_name": name,
+            "submission_id": submission_id,
+            "archive_verified": verified,
+            "competition": args.competition,
+            "task": task,
+            "model": model,
+            "package": package,
+            "metrics": metrics,
+            "run_url": f"{config.base_url}/runs/{run_id}",
+        }
+        path = _record_path(record_dir, args.competition, task)
+        write_record(path, record, tuple(client.known_secrets))
+        log(f"result: {json.dumps(metrics, ensure_ascii=False)}")
+        log(f"record: {path}")
+    return 0 if args.no_wait else _terminal_exit_code(runs)
 
 
 def resolve_run_id(args: argparse.Namespace) -> argparse.Namespace:
-    """Accept a run id positionally or as --run-id, and settle on one field."""
-    if getattr(args, "run_id", None) and not getattr(args, "run", None):
-        args.run = args.run_id
+    """Accept run ids positionally or as --run-id, and settle on one field."""
+    run_id = getattr(args, "run_id", None)
+    current = getattr(args, "run", None)
+    if run_id and not current:
+        args.run = [run_id] if isinstance(current, list) else run_id
     return args
 
 
@@ -733,6 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("balance", "read the metering balance and billing freshness", cmd_balance)
 
+    add("models", "list the gateway's models and their published prices", cmd_models)
+
     command = add("tasks", "list competitions, or one competition's tasks", cmd_tasks)
     command.add_argument("competition", nargs="?", help="competition id; omit to list competitions")
     command.add_argument("-v", "--verbose", action="store_true", help="also list every task")
@@ -771,9 +881,16 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--runtime", choices=("python", "node"), default="python")
     command.add_argument("--api-key-env", help="read the model key from this environment variable")
 
-    command = add("run", "create a run from a saved submission, then start it", cmd_run)
+    command = add("run", "create and start one run per task, from a saved submission", cmd_run)
     command.add_argument("submission")
-    command.add_argument("--task", required=True)
+    command.add_argument(
+        "--task", action="append", help="task to run; repeat for several tasks"
+    )
+    command.add_argument(
+        "--all-tasks",
+        action="store_true",
+        help="run every task of the submission's competition",
+    )
     command.add_argument("--queue-timeout", type=float, default=None)
 
     command = add("start", "start an existing PENDING run, waiting for queue capacity", cmd_start)
@@ -784,14 +901,16 @@ def build_parser() -> argparse.ArgumentParser:
     command = add("cancel", "cancel one run, then read the resulting state", cmd_cancel)
     command.add_argument("run")
 
-    command = add("status", "list runs, or read one run", cmd_status)
-    command.add_argument("run", nargs="?")
+    command = add("status", "list runs, or read one or more runs", cmd_status)
+    command.add_argument("run", nargs="*")
     command.add_argument("--run-id", help="alternative spelling of the positional run id")
     command.add_argument("--limit", type=int, default=10)
     command.add_argument("--full", action="store_true", help="print the redacted full response")
 
-    command = add("wait", "poll one run until it finishes or the deadline expires", cmd_wait)
-    command.add_argument("run")
+    command = add(
+        "wait", "poll runs until they finish or the deadline expires", cmd_wait
+    )
+    command.add_argument("run", nargs="+")
     command.add_argument("--interval", type=float, default=10.0)
     command.add_argument("--timeout", type=float, default=1200.0)
 
@@ -817,7 +936,12 @@ def build_parser() -> argparse.ArgumentParser:
     command = add("submit", "upload, start one task, and record the result", cmd_submit)
     command.add_argument("--package", required=True)
     command.add_argument("--competition", required=True)
-    command.add_argument("--task", required=True)
+    command.add_argument(
+        "--task", action="append", help="task to run; repeat for several tasks"
+    )
+    command.add_argument(
+        "--all-tasks", action="store_true", help="run every task of the competition"
+    )
     command.add_argument("--name")
     command.add_argument("--model")
     command.add_argument("--runtime", choices=("python", "node"), default="python")
