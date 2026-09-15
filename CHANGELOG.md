@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.3.0 — concurrency and meter login
+
+### The concurrency doctrine was wrong
+
+Version 0.2.0's README and agent skill stated two hard rules: never let two runs
+on one account overlap, and never upload while a run is pending. Measured on
+2026-09-15, neither is a platform constraint. Two saved submissions for
+`arc-bench-web` (`672b777e6cbe` and `68d7d015431f`) held **seven runs in
+`RUNNING` at the same time** — five tasks of the first and two of the second —
+all past `deploy_agent`, none stranded, and every one reached a terminal state on
+its own. The leaderboard takes the most recent completed run per task, and a
+competition score is the highest average across every saved submission.
+
+The one real cost of overlap remains: the official token count is a usage-meter
+delta on the shared access key, so any traffic on that key during a run — another
+run, or a local gateway call — is added to that run's token and cost figures.
+That affects the cost-efficiency ranking (senior tier, pass rate ≥ 80%) and
+nothing else. The doctrine is now **serialize when the cost figure matters,
+otherwise run concurrently**, in the README (both languages), the agent skill and
+the code.
+
+No code path had ever enforced the old rules, so nothing had to be unblocked.
+
+### Concurrency
+
+* `run SUBMISSION` takes `--task` repeatedly and `--all-tasks` (every task of the
+  submission's competition, resolved through the submissions list and the
+  competition detail). It creates and starts one run per task, tolerating a queue
+  wait for each, and prints `run_id task status` per line. A task that fails to
+  start does not stop the ones after it: the batch continues and the exit code is
+  `1`, with that task's entry carrying `run_id` and `start_error`.
+* `submit` takes the same repeated `--task` and `--all-tasks`. It uploads once,
+  starts every task, then waits for all of them together, and writes one result
+  record per task.
+* `wait` takes several run ids and polls them round-robin until all finish. Each
+  observed state change prints one line carrying its `run_id`. Exit `0` when every
+  run PASSED, `1` when any finished otherwise, `2` when the deadline expired with
+  one still going.
+* `status` takes several run ids and prints one record per run.
+* The submission budget (`ARC_BENCH_MAX_SUBMISSIONS`) now counts distinct
+  submissions rather than result files, so one submission run against many tasks
+  spends one unit of the budget.
+
+### Metering without a browser cookie
+
+`meter.arc-bench.com` accepts the gateway access key as a login, verified against
+the live service on 2026-09-15: `POST /api/user/login` with
+`{"access_key": "…"}` returns the account and sets `onr_user_session` for twelve
+hours; a wrong key returns HTTP 401 `{"error":"invalid access key"}`.
+
+* `balance` and `whoami --meter` log in with the access key — `ARC_BENCH_API_KEY`,
+  or the account key read from `/api/auth/access-key` — and hold the cookie for
+  the process. `ARC_BENCH_METER_COOKIE` stays as an override when it is set.
+* `balance` also reports the account id (redacted the same way `whoami` does) and
+  keeps decimal amounts as strings; a negative balance is a legal value the live
+  meter really returns.
+* New `models` command prints the gateway's price table — id, provider,
+  availability, input / cache-hit / output price and unit — with `--json` giving
+  the raw list.
+* The access key and the session cookie are redacted in every log and error path,
+  as every other credential already was.
+
+### Contract changes
+
+* `run --json` now prints a JSON **array**, one entry per task, where 0.2.0
+  printed a single object. Single-task callers should read element `0`.
+* `wait` and `status` take one or more run ids where they took exactly one.
+* `--task` is no longer required on `run` and `submit`; one of `--task` or
+  `--all-tasks` must be given, and `--task` may be repeated.
+* `balance` gains an `account` field.
+
+### Tests
+
+The suite grew from 76 checks to 90. The new ones cover the meter login flow
+(success, a rejected key, the cookie override, and the account-key fallback),
+`models`, multi-task `run` including one failed start, `--all-tasks` resolution
+from a submission, and multi-id `wait` and `status` exit codes. The meter
+responses in `tests/fixtures/meter-responses.json` are the live service's own
+replies with the account identifiers removed. No test touches the network.
+
 ## 0.2.0 — consolidation
 
 This release merges a second, newer ARC-Bench client that had been developed
