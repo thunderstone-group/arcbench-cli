@@ -691,7 +691,7 @@ class OfficialClient:
 
     def list_runs(
         self,
-        limit: int = 10,
+        limit: int | None = 10,
         task: str | None = None,
         submission: str | None = None,
     ) -> list[dict[str, Any]]:
@@ -703,7 +703,9 @@ class OfficialClient:
             }
         )
         payload = self.request("GET", "/runs" + (f"?{query}" if query else ""))
-        return (payload if isinstance(payload, list) else [])[:limit]
+        if not isinstance(payload, list):
+            raise ApiError("expected a run list", method="GET", path="/runs")
+        return payload if limit is None else payload[:limit]
 
     def leaderboard(
         self,
@@ -756,7 +758,10 @@ class OfficialClient:
         balance = self.request("GET", "/user/balance")
         snapshot = balance.get("balance") or {} if isinstance(balance, dict) else {}
         freshness = self.request("GET", "/user/freshness")
-        freshness = freshness if isinstance(freshness, dict) else {}
+        if (not isinstance(balance, dict) or balance.get("ok") is False
+                or not isinstance(snapshot, dict) or not isinstance(freshness, dict)
+                or freshness.get("ok") is False):
+            raise ApiError("invalid meter balance or freshness response", method="GET", path="/user/balance")
         return {
             "account": redact(str(snapshot.get("account_id", "")) or None),
             # Decimal amounts stay strings; a zero balance is not missing, and
@@ -881,6 +886,7 @@ class OfficialClient:
                 "run creation response had no id: " + json.dumps(run, ensure_ascii=False)[:300],
                 method="POST",
                 path="/runs",
+                uncertain=True,
             )
         # Creating a run only persists it as PENDING. Starting is a separate
         # call so a 429 queue wait can retry the same run id.
@@ -889,8 +895,14 @@ class OfficialClient:
     def start_run(self, run_id: str) -> dict[str, Any]:
         status, payload = self._request("POST", f"{self.config.base_url}/api/runs/{quote(run_id)}/start")
         if not 200 <= status < 300:
-            raise RunStartError(str(run_id), status, payload, self.last_response_headers)
-        return unwrap(payload, "run")
+            raise RunStartError(str(run_id), status, self.safe(payload), self.last_response_headers)
+        run = unwrap(payload, "run")
+        if str(run.get("id") or run.get("run_id")) != str(run_id) or not run.get("status"):
+            raise ApiError(
+                f"run {run_id} start response was incomplete; inspect its status before another write",
+                method="POST", path=f"/runs/{quote(run_id)}/start", uncertain=True,
+            )
+        return run
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         """Send exactly one cancellation, then read the resulting state.
@@ -924,12 +936,19 @@ class OfficialClient:
         run_id: str,
         timeout_seconds: float = DEFAULT_QUEUE_TIMEOUT,
         on_wait=None,
+        before_start=None,
     ) -> dict[str, Any]:
         """Start one run, retrying only HTTP 429 capacity rejections."""
         timeout_seconds = float(timeout_seconds)
         deadline = time.monotonic() + timeout_seconds
         attempts = 0
         while True:
+            if before_start:
+                try:
+                    before_start()
+                except ApiError as error:
+                    error.details["run_id"] = run_id
+                    raise
             attempts += 1
             try:
                 return self.start_run(run_id)

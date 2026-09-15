@@ -16,6 +16,8 @@ import sys
 import urllib.error
 import zipfile
 from datetime import datetime, timezone
+from dataclasses import replace
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,7 @@ from .client import (
     write_record,
 )
 from .session import capture_chrome_cookie, default_env_path
+from .preflight import LaunchPreflight, PreflightError, launch_lock
 
 PACKAGE_EXCLUDED = {"node_modules", ".git", "dist", "__pycache__", ".venv", ".pytest_cache"}
 ENTRYPOINTS = ("main.py", "index.js", "index.ts")
@@ -95,10 +98,14 @@ def _meter_client(args: argparse.Namespace) -> tuple[dict[str, str], OfficialCli
     wins when it is set, for an account whose key is not at hand.
     """
     env, config = _config(args)
+    return env, _meter_from_config(config)
+
+
+def _meter_from_config(config: SubmitConfig, website: OfficialClient | None = None) -> OfficialClient:
     meter = config.for_meter()
     client = OfficialClient(meter)
     if meter.session_cookie:
-        return env, client
+        return client
     key = meter.api_key
     if not key:
         if not config.session_cookie:
@@ -106,11 +113,32 @@ def _meter_client(args: argparse.Namespace) -> tuple[dict[str, str], OfficialCli
                 "no metering credential: set ARC_BENCH_API_KEY, or a website session "
                 "(`arcbench session`) so the account key can be read, or ARC_BENCH_METER_COOKIE"
             )
-        key = OfficialClient(config).access_key()
+        key = (website or OfficialClient(config)).access_key()
     if not key:
         raise CliError("the account has no gateway access key to log in to the meter with")
     client.meter_login(key)
-    return env, client
+    return client
+
+
+def _locked_launch(command):
+    @wraps(command)
+    def locked(args):
+        if getattr(args, "dry_run", False):
+            return command(args)
+        with launch_lock():
+            return command(args)
+    return locked
+
+
+def _launch_preflight(args, client, api_key=None) -> LaunchPreflight:
+    config = client.config
+    if api_key is not None:
+        # Check the explicitly selected upload key, not an unrelated meter cookie.
+        config = replace(config, api_key=api_key, meter_cookie="")
+    return LaunchPreflight(
+        client, lambda: _meter_from_config(config, client),
+        getattr(args, "min_balance", "0"), getattr(args, "allow_concurrent", False),
+    )
 
 
 def _default_record_dir(env: dict[str, str]) -> Path:
@@ -518,6 +546,7 @@ def cmd_upload(args: argparse.Namespace) -> int:
     return 0 if result["archive_verified"] else 1
 
 
+@_locked_launch
 def cmd_run(args: argparse.Namespace) -> int:
     """Create and start one run per task. Two API calls each, never retried.
 
@@ -528,22 +557,36 @@ def cmd_run(args: argparse.Namespace) -> int:
     _, client = _client(args)
     tasks = _resolve_tasks(client, args.submission, args.task, args.all_tasks)
     timeout = _queue_timeout(args, client.config)
+    preflight = _launch_preflight(args, client)
+    checked = preflight.check(task_count=len(tasks))
     records: list[dict[str, Any]] = []
     lines: list[str] = []
     started_all = True
+    uncertain_write = False
     for task in tasks:
-        record: dict[str, Any] = {"task": task}
+        record: dict[str, Any] = {"task": task, "preflight": checked}
+        if uncertain_write:
+            record["start_error"] = {"reason": "previous_outcome_uncertain", "error": "inspect the previous write before launching more tasks"}
+            records.append(record)
+            lines.append(f"- {task} skipped after an uncertain write")
+            continue
         run_id = ""
         try:
+            if records:
+                record["preflight"] = preflight.check()
             run = client.create_run(args.submission, task)
             run_id = str(run.get("id") or run.get("run_id"))
             record["run_id"] = run_id
             record["url"] = f"{client.config.base_url}/runs/{run_id}"
-            started = client.start_run_with_queue_wait(run_id, timeout, on_wait=_on_queue_wait)
+            started = client.start_run_with_queue_wait(
+                run_id, timeout, on_wait=_on_queue_wait,
+                before_start=lambda: preflight.check(target_run=run_id),
+            )
             record["run"] = summarize_run(started)
             lines.append(f"{run_id} {task} {started.get('status')}")
         except (ApiError, RunQueueTimeoutError) as error:
             started_all = False
+            uncertain_write = isinstance(error, ApiError) and error.uncertain
             record["start_error"] = (
                 error.details if isinstance(error, ApiError) else {"error": str(error)}
             )
@@ -557,14 +600,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0 if started_all else 1
 
 
+@_locked_launch
 def cmd_start(args: argparse.Namespace) -> int:
     if not args.run:
         raise CliError("start needs a run id, as a positional argument or --run-id")
     _, client = _client(args)
+    timeout = _queue_timeout(args, client.config)
+    current = client.get_run(args.run)
+    if current.get("status") != "PENDING":
+        raise PreflightError("run_not_pending", "start requires a confirmed PENDING run", run_id=args.run)
+    preflight = _launch_preflight(args, client)
+    checked = preflight.check(target_run=args.run)
     run = client.start_run_with_queue_wait(
-        args.run, _queue_timeout(args, client.config), on_wait=_on_queue_wait
+        args.run, timeout, on_wait=_on_queue_wait,
+        before_start=lambda: preflight.check(target_run=args.run),
     )
     summary = summarize_run(run)
+    summary["preflight"] = checked
     emit(args, summary, [f"run started: {args.run}", f"result: {json.dumps(summary, ensure_ascii=False)}"])
     return 0
 
@@ -725,6 +777,7 @@ def cmd_source(args: argparse.Namespace) -> int:
     return 0
 
 
+@_locked_launch
 def cmd_submit(args: argparse.Namespace) -> int:
     """Upload, start one task and record the result, in one command."""
     env, config = _config(args)
@@ -764,6 +817,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
         log("dry-run: nothing submitted")
         return 0
 
+    timeout = _queue_timeout(args, config)
+    api_key = _resolve_key(args) if not args.submission_id else None
+    preflight = _launch_preflight(args, client, api_key)
+    checked = preflight.check(task_count=len(tasks))
     enforce_budget(record_dir, config)
 
     if args.submission_id:
@@ -777,23 +834,29 @@ def cmd_submit(args: argparse.Namespace) -> int:
             name,
             model,
             args.runtime,
-            _resolve_key(args),
+            api_key,
         )
         submission_id = uploaded["submission"].get("id")
         verified = uploaded["archive_verified"]
         if not submission_id:
             raise CliError("submission response had no id")
         log(f"submission created: {submission_id} archive_verified={verified}")
+        if not verified:
+            error = ApiError("saved archive could not be verified; inspect the submission before starting")
+            error.details.update(reason="archive_unverified", submission_id=submission_id)
+            raise error
 
     # Every task is started before any is waited on: the platform runs them
     # concurrently, and serialising them here would only make the batch slower.
     started: list[tuple[str, str, dict[str, Any]]] = []
     for task in tasks:
+        preflight.check()
         run = client.create_run(str(submission_id), task)
         run_id = str(run.get("id") or run.get("run_id"))
         log(f"run created: {run_id}  task={task}  status={run.get('status', 'PENDING')}")
         run = client.start_run_with_queue_wait(
-            run_id, _queue_timeout(args, config), on_wait=_on_queue_wait
+            run_id, timeout, on_wait=_on_queue_wait,
+            before_start=lambda: preflight.check(target_run=run_id),
         )
         log(f"run started: {run_id}  {config.base_url}/runs/{run_id}")
         started.append((task, run_id, run))
@@ -829,6 +892,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             "competition": args.competition,
             "task": task,
             "model": model,
+            "preflight": checked,
             "package": package,
             "metrics": metrics,
             "run_url": f"{config.base_url}/runs/{run_id}",
@@ -937,7 +1001,12 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--runtime", choices=("python", "node"), default="python")
     command.add_argument("--api-key-env", help="read the model key from this environment variable")
 
+    def launch_options(command):
+        command.add_argument("--min-balance", default="0", help="minimum available balance in the meter currency; balance must also be positive")
+        command.add_argument("--allow-concurrent", action="store_true", help="explicitly accept overlapping runs and contaminated per-run cost; never bypass balance, pending billing or lock checks")
+
     command = add("run", "create and start one run per task, from a saved submission", cmd_run)
+    launch_options(command)
     command.add_argument("submission")
     command.add_argument(
         "--task", action="append", help="task to run; repeat for several tasks"
@@ -950,6 +1019,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--queue-timeout", type=float, default=None)
 
     command = add("start", "start an existing PENDING run, waiting for queue capacity", cmd_start)
+    launch_options(command)
     command.add_argument("run", nargs="?")
     command.add_argument("--run-id", help="alternative spelling of the positional run id")
     command.add_argument("--queue-timeout", type=float, default=None)
@@ -990,6 +1060,7 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("--output", required=True)
 
     command = add("submit", "upload, start one task, and record the result", cmd_submit)
+    launch_options(command)
     command.add_argument("--package", required=True)
     command.add_argument("--competition", required=True)
     command.add_argument(
