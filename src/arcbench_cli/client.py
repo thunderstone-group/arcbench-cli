@@ -31,6 +31,7 @@ import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,15 @@ DEFAULT_MIN_INTERVAL = 30.0
 DEFAULT_QUEUE_TIMEOUT = 3600.0
 DEFAULT_RETRY_AFTER = 30.0
 DEFAULT_POLL_TOLERANCE = 2
+DEFAULT_REQUEST_LIMIT = 20
+
+USAGE_COUNTS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "cached_tokens",
+    "quantity",
+    "usage_event_count",
+)
 
 SESSION_COOKIE = "arcbench_session"
 METER_SESSION_COOKIE = "onr_user_session"
@@ -764,6 +774,31 @@ class OfficialClient:
         models = payload.get("models") if isinstance(payload, dict) else payload
         return models if isinstance(models, list) else []
 
+    def usage(self, granularity: str = "hour") -> list[dict[str, Any]]:
+        """Read metered usage, one row per time bucket and model.
+
+        ``granularity`` is sent for forward compatibility, but the service
+        ignores it: every value observed returns the same hourly rows, with
+        ``bucket_size`` always ``1h``. Re-bucketing happens in
+        :func:`aggregate_usage`.
+        """
+        query = urllib.parse.urlencode({"granularity": granularity})
+        payload = self.request("GET", f"/user/usage?{query}")
+        rows = payload.get("rows") if isinstance(payload, dict) else payload
+        return rows if isinstance(rows, list) else []
+
+    def request_log(self, limit: int = DEFAULT_REQUEST_LIMIT) -> list[dict[str, Any]]:
+        """Read billed gateway requests, newest first.
+
+        The service ignores ``limit`` and returns the whole history in
+        ascending order, so the newest ``limit`` entries are taken here.
+        """
+        payload = self.request("GET", f"/user/requests?limit={int(limit)}")
+        entries = payload.get("requests") if isinstance(payload, dict) else payload
+        entries = entries if isinstance(entries, list) else []
+        entries = sorted(entries, key=lambda entry: entry.get("occurred_at") or 0, reverse=True)
+        return entries[: max(0, int(limit))]
+
     def download_submission_archive(self, submission_id: str) -> bytes:
         return self.binary(f"/submissions/{quote(submission_id)}/archive")
 
@@ -1068,6 +1103,105 @@ def summarize_run(run: dict[str, Any]) -> dict[str, Any]:
     if run.get("poll_timed_out"):
         summary["poll_timed_out"] = True
     return summary
+
+
+def parse_iso(value: str) -> datetime:
+    """Parse the meter's timestamps, treating a naive one as UTC."""
+    parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _add_amount(total: str, addend: Any) -> str:
+    """Add two decimal strings without going through a float."""
+    try:
+        return str(Decimal(total) + Decimal(str(addend)))
+    except (InvalidOperation, ValueError):
+        return total
+
+
+def aggregate_usage(
+    rows: list[dict[str, Any]],
+    granularity: str = "hour",
+    since: str | None = None,
+    model: str | None = None,
+) -> list[dict[str, Any]]:
+    """Select and re-bucket metered usage rows, keeping the server's shape.
+
+    The service ignores its own ``granularity``, ``since`` and ``model`` query
+    parameters and always answers with the full hourly history, so every
+    selection is made here against what it does return. Amounts are decimal
+    strings and are summed as decimals.
+    """
+    cutoff = parse_iso(since) if since else None
+    selected: list[dict[str, Any]] = []
+    for row in rows:
+        dimensions = row.get("dimensions") or {}
+        if model and dimensions.get("model") != model:
+            continue
+        bucket = str(dimensions.get("bucket") or "")
+        if cutoff is not None:
+            try:
+                if parse_iso(bucket) < cutoff:
+                    continue
+            except ValueError:
+                continue
+        selected.append(row)
+    if granularity != "day":
+        return selected
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in selected:
+        dimensions = row.get("dimensions") or {}
+        measures = row.get("measures") or {}
+        key = (str(dimensions.get("bucket") or "")[:10], str(dimensions.get("model") or ""))
+        entry = merged.get(key)
+        if entry is None:
+            merged[key] = {
+                "dimensions": {"bucket": key[0], "model": key[1]},
+                "measures": {
+                    "amount": str(measures.get("amount", "0")),
+                    **{name: int(measures.get(name) or 0) for name in USAGE_COUNTS},
+                },
+            }
+            continue
+        entry["measures"]["amount"] = _add_amount(
+            entry["measures"]["amount"], measures.get("amount", 0)
+        )
+        for name in USAGE_COUNTS:
+            entry["measures"][name] += int(measures.get(name) or 0)
+    return list(merged.values())
+
+
+def usage_total(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sum one selection of usage rows into a single total."""
+    total: dict[str, Any] = {"buckets": len(rows), "amount": "0"}
+    total.update({name: 0 for name in USAGE_COUNTS})
+    for row in rows:
+        measures = row.get("measures") or {}
+        total["amount"] = _add_amount(total["amount"], measures.get("amount", 0))
+        for name in USAGE_COUNTS:
+            total[name] += int(measures.get(name) or 0)
+    return total
+
+
+def summarize_request(entry: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one billed request into the fields worth printing."""
+    metrics = entry.get("metrics") or {}
+    occurred = entry.get("occurred_at")
+    return {
+        "occurred_at": (
+            datetime.fromtimestamp(int(occurred), timezone.utc).isoformat().replace("+00:00", "Z")
+            if isinstance(occurred, (int, float))
+            else occurred
+        ),
+        "model": entry.get("model"),
+        "total_tokens": metrics.get("total_tokens"),
+        "input_tokens": metrics.get("input_tokens"),
+        "output_tokens": metrics.get("output_tokens"),
+        "cached_tokens": metrics.get("cached_tokens"),
+        "amount": metrics.get("amount"),
+        "currency": metrics.get("currency"),
+        "request_id": entry.get("request_id"),
+    }
 
 
 def summarize_submission(submission: dict[str, Any]) -> dict[str, Any]:

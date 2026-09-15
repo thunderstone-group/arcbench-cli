@@ -21,16 +21,20 @@ from typing import Any
 
 from . import __version__
 from .client import (
+    DEFAULT_REQUEST_LIMIT,
     ApiError,
     OfficialClient,
     RunQueueTimeoutError,
     SubmitConfig,
+    aggregate_usage,
     enforce_budget,
     load_env,
     log_summary,
     progress_line,
+    summarize_request,
     summarize_run,
     summarize_submission,
+    usage_total,
     validate_package,
     write_record,
 )
@@ -230,6 +234,50 @@ def cmd_models(args: argparse.Namespace) -> int:
             f"{pricing.get('unit') or ''}"
         )
     emit(args, models, lines)
+    return 0
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Print metered usage per bucket and model, with a total.
+
+    The meter ignores its own `granularity`, `since` and `model` parameters and
+    always answers with the full hourly history, so the selection is made here.
+    """
+    _, client = _meter_client(args)
+    rows = aggregate_usage(client.usage(args.granularity), args.granularity, args.since, args.model)
+    lines = [
+        f"{str((row.get('dimensions') or {}).get('bucket', '-')):26s} "
+        f"{str((row.get('dimensions') or {}).get('model', '-')):28s} "
+        f"amount={(row.get('measures') or {}).get('amount')} "
+        f"prompt={(row.get('measures') or {}).get('prompt_tokens')} "
+        f"completion={(row.get('measures') or {}).get('completion_tokens')} "
+        f"cached={(row.get('measures') or {}).get('cached_tokens')} "
+        f"events={(row.get('measures') or {}).get('usage_event_count')}"
+        for row in rows
+    ]
+    total = usage_total(rows)
+    lines.append(
+        f"{'TOTAL':26s} {total['buckets']} bucket{'' if total['buckets'] == 1 else 's':17s} "
+        f"amount={total['amount']} "
+        f"prompt={total['prompt_tokens']} completion={total['completion_tokens']} "
+        f"cached={total['cached_tokens']} events={total['usage_event_count']}"
+    )
+    emit(args, rows, lines)
+    return 0
+
+
+def cmd_requests(args: argparse.Namespace) -> int:
+    """Print the newest billed gateway requests."""
+    _, client = _meter_client(args)
+    entries = client.request_log(args.limit)
+    summaries = [summarize_request(entry) for entry in entries]
+    lines = [
+        f"{str(item['occurred_at']):22s} {str(item['model']):28s} "
+        f"tokens={item['total_tokens']} (in {item['input_tokens']} / out {item['output_tokens']} "
+        f"/ cached {item['cached_tokens']}) amount={item['amount']} {item['request_id']}"
+        for item in summaries
+    ]
+    emit(args, entries, lines)
     return 0
 
 
@@ -842,6 +890,14 @@ def build_parser() -> argparse.ArgumentParser:
     add("balance", "read the metering balance and billing freshness", cmd_balance)
 
     add("models", "list the gateway's models and their published prices", cmd_models)
+
+    command = add("usage", "read metered usage per bucket and model", cmd_usage)
+    command.add_argument("--granularity", choices=("hour", "day"), default="hour")
+    command.add_argument("--since", help="keep buckets at or after this ISO timestamp")
+    command.add_argument("--model", help="keep only this model's rows")
+
+    command = add("requests", "read the newest billed gateway requests", cmd_requests)
+    command.add_argument("--limit", type=int, default=DEFAULT_REQUEST_LIMIT)
 
     command = add("tasks", "list competitions, or one competition's tasks", cmd_tasks)
     command.add_argument("competition", nargs="?", help="competition id; omit to list competitions")

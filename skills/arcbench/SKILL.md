@@ -67,7 +67,14 @@ metering site with the gateway access key:
 ```sh
 arcbench balance                       # account, balance, currency, as_of, pending events
 arcbench models                        # every gateway model, provider and price
+arcbench usage --granularity day       # metered spend per bucket and model, with a total
+arcbench requests --limit 20           # the newest billed gateway calls
 ```
+
+**Check `balance` before starting a batch of runs** — see the platform rules below.
+The meter ignores its own `granularity`, `since` and `limit` parameters, so `usage`
+merges hours into days itself and `requests --limit` takes the newest N locally;
+`usage` also takes `--since ISO` and `--model M`.
 
 Notes per step: **upload** downloads the stored archive back and compares
 SHA-256 against the local file — exit `1` means they don't match; the JSON record
@@ -111,11 +118,18 @@ field in the JSON, don't treat exit `1` as failure. `leaderboard` requires
   `deploy_agent`, none stranded. There is no rule against overlapping runs, and no
   rule against uploading while a run is pending; earlier versions of this skill
   said there was, and were wrong.
-- **Serialize only when the cost figure matters.** The official token count is a
-  usage-meter delta on the shared access key, so a second run, or the agent's own
-  local gateway calls, inflate the token and cost figures of whatever is running.
-  That affects the cost-efficiency ranking (senior tier, pass rate ≥ 80%) and
-  nothing else; pass rate is unaffected.
+- **A concurrent run's cost column is meaningless.** The official token count is a
+  usage-meter delta on the shared access key and cannot tell whose traffic it
+  measured: in the same 2026-09-15 batch all seven runs were stamped with roughly
+  the same figures (`Meter usage captured: tokens=29910448, cost=36.452976 CNY`),
+  each delta spanning the whole batch. That is what the cost-efficiency ranking
+  (senior tier, pass rate ≥ 80%) reads; pass rate is unaffected. Serialize only
+  when the cost figure matters.
+- **The balance is a shared hard ceiling. Run `arcbench balance` before a batch.**
+  That batch drove the account to −1.35 CNY; the gateway then returned HTTP 402
+  `insufficient_balance` and every run failed in generation — all seven FAILED for
+  that reason, not for anything in the agents. Concurrency multiplies the burn
+  rate. Afterwards, `arcbench usage` shows where the money went.
 - **The leaderboard shows the latest completed run per task, not the best one.**
   A competition score is the highest average across every saved submission.
 - **Never retry a mutating call** (`upload`, `run`, `start`, `cancel`) after an
@@ -156,8 +170,10 @@ leaderboard`，各步示例见上文英文部分，命令与参数完全一致�
 可重复、也可换成 `--all-tasks` 一次起完整个赛题；`wait` 和 `status` 能一次接多个 run id。
 无人值守场景优先用 `arcbench submit`，一条命令收敛 upload/run/wait 并写 JSON 结果记录。
 
-**账号与网关**：`arcbench balance` 和 `arcbench models` 用网关 access key 登录计量站，
-**不需要浏览器 cookie**，分别给出余额/账期和全部模型的价格表。
+**账号与网关**：`balance`、`models`、`usage`、`requests` 都用网关 access key 登录计量站，
+**不需要浏览器 cookie**，分别给出余额/账期、模型价格表、分桶用量、计费请求流水。**开一批运行
+之前先跑 `balance`**，原因见下。计量站不认自己的 `granularity`/`since`/`limit` 参数，所以按天
+合并和取最新 N 条都由客户端做。
 
 **退出码**：`0` 成功；`1` 请求失败、有任务没启动成功，或有运行进入非通过终态；`2` 本地
 等待超时或未登录。多个运行时：只要有一个跑完且没通过就是 `1`，否则只要有一个到点还没跑完
@@ -168,9 +184,12 @@ leaderboard`，各步示例见上文英文部分，命令与参数完全一致�
 **平台真实规则**（CLI 不能替 agent 全部强制执行）：**默认就并发**——平台本身并发跑提交和
 任务，2026-09-15 实测 `arc-bench-web` 下两份提交同时有七个运行在 `RUNNING`（一份五个任务、
 另一份两个），全部越过 `deploy_agent` 且没有一个被挤掉；本 skill 早先写的「运行不能重叠」
-「pending 时不能上传」两条都不成立，已删。**只有在乎成本数字时才串行**：官方 token 计数是
-共享 access key 上的计量差值，并发的运行和 agent 自己的本地网关调用都会被算进去，这只影响
-性价比榜（senior 档，通过率 ≥ 80%），对通过率没有影响。排行榜展示的是每个任务最近一次
+「pending 时不能上传」两条都不成立，已删。**并发运行的成本列没有意义**：官方 token 计数是共享
+access key 上的计量差值，分不清测到的是谁的流量——同一批七个运行被打上了几乎相同的数字
+（`Meter usage captured: tokens=29910448, cost=36.452976 CNY`），每个差值都横跨整批。性价比榜
+（senior 档，通过率 ≥ 80%）读的正是它，通过率不受影响，所以只有在乎成本数字时才串行。
+**余额是共享的硬上限**：那一批把账户打到 −1.35 CNY，之后网关返回 HTTP 402
+`insufficient_balance`，七个运行全部在生成阶段失败——开批之前先 `arcbench balance`。排行榜展示的是每个任务最近一次
 **完成**的运行，赛题总分取所有已保存提交里最高的那个平均值。
 
 **绝对不能做**：量 token 的运行旁边继续花这把 key；报错后盲目重试写请求（`upload`/`run`/

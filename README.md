@@ -106,12 +106,22 @@ arcbench whoami
 arcbench whoami --meter                        # the metering service's own session
 arcbench balance                               # logs in with the gateway access key
 arcbench models                                # the gateway's price table
+arcbench usage --granularity day               # metered spend per bucket and model
+arcbench usage --since 2026-09-15T00:00:00Z --model deepseek-v4-flash
+arcbench requests --limit 20                   # the newest billed gateway calls
 ```
 
-`balance` and `models` sign in to `meter.arc-bench.com` with the gateway access
-key (`ARC_BENCH_API_KEY`, or the account key read from `/api/auth/access-key`),
-so no browser cookie is needed for them. `ARC_BENCH_METER_COOKIE` still wins when
-it is set.
+These four sign in to `meter.arc-bench.com` with the gateway access key
+(`ARC_BENCH_API_KEY`, or the account key read from `/api/auth/access-key`), so no
+browser cookie is needed for them. `ARC_BENCH_METER_COOKIE` still wins when it is
+set.
+
+The meter ignores its own `granularity`, `since` and `limit` query parameters:
+`/api/user/usage` always answers with the full hourly history and
+`/api/user/requests` with every billed request, oldest first. So `usage` sums
+hour buckets into days itself, `--since` and `--model` select client-side, and
+`requests --limit` takes the newest N. Amounts are decimal strings throughout and
+are added as decimals, never as floats.
 
 Submitting and running:
 
@@ -180,13 +190,22 @@ Earlier versions of this README stated two hard rules — never let two runs
 overlap, never upload while a run is pending. Neither is a platform constraint,
 and both are gone.
 
-**The one real cost of overlap** is the official token count, which is a
-usage-meter delta on the shared access key. Anything that spends tokens on that
-key while a run is in flight — another run, or the agent's own local gateway
-calls — lands in that run's token figure. That matters for the cost-efficiency
-ranking (senior tier, pass rate ≥ 80%) and for nothing else; pass rate is
-unaffected. **Serialize when the cost figure matters, otherwise run
-concurrently.**
+**What overlap does cost is the cost column.** The official token count is a
+usage-meter delta on the shared access key, so it cannot tell whose traffic it
+measured. In the same 2026-09-15 batch every one of the seven runs was stamped
+with roughly the same figures — the run log says `Meter usage captured:
+tokens=29910448, cost=36.452976 CNY` — because each delta spanned all seven runs
+at once. Those numbers are the batch's total, not any one run's, and they are
+what the cost-efficiency ranking (senior tier, pass rate ≥ 80%) reads. Pass rate
+is unaffected. **Serialize when the cost figure matters, otherwise run
+concurrently and treat the cost column as meaningless.**
+
+**The balance is a hard ceiling, and it is shared too.** That same batch drove the
+account to −1.35 CNY, after which the gateway answered HTTP 402
+`insufficient_balance` and *every* run failed in generation — the seven runs above
+all finished FAILED for that reason, not for anything in the agents. Concurrency
+multiplies the burn rate, so **run `arcbench balance` before starting a batch**,
+and `arcbench usage` afterwards to see where the money went.
 
 The client follows from that:
 
@@ -288,11 +307,15 @@ leaderboard shows the latest completed run per task, not the best one.
 
 ### What an agent must never do
 
-* **Spend tokens on the shared key beside a run whose cost figure matters.** The
-  official token count is a usage-meter delta on that key, so a second run or a
-  local gateway call inflates the first run's tokens. It costs nothing but the
-  cost-efficiency ranking, so overlap freely when pass rate is what is being
-  measured, and serialize when the token figure is.
+* **Start a batch without checking the balance.** The balance is a shared hard
+  ceiling: once it goes negative the gateway returns HTTP 402
+  `insufficient_balance` and every run in flight fails in generation. Check
+  `arcbench balance` first.
+* **Believe a concurrent run's cost column.** The official token count is a
+  usage-meter delta on the shared key, so overlapping runs are each stamped with
+  the whole batch's usage. It costs nothing but the cost-efficiency ranking, so
+  overlap freely when pass rate is what is being measured, and serialize when the
+  token figure is.
 * **Retry a mutating call after an error.** `upload`, `run`, `start` and `cancel` are
   writes. When the outcome cannot be observed the error says `outcome_uncertain` and
   names the id; read that id's state and decide, rather than repeating the call. The
@@ -361,6 +384,8 @@ against the live service. The bundle is not vendored.
 | Meter balance | `GET /api/user/balance` |
 | Meter freshness | `GET /api/user/freshness` |
 | Meter model prices | `GET /api/user/models` |
+| Meter usage | `GET /api/user/usage?granularity=…` (the parameter is ignored; always hourly) |
+| Meter billed requests | `GET /api/user/requests?limit=N` (the parameter is ignored; all rows, oldest first) |
 
 Two observed quirks the client handles rather than papers over. The cost field
 is named `token_cost_usd` but carries an explicit `token_cost_currency` that is
@@ -467,13 +492,18 @@ agent 用这个。
 命令、示例与退出码见上文英文部分，行为完全一致：
 
 * 查看类：`competitions`、`tasks`、`fetch`、`leaderboard`、`submissions`、`runs`
-* 账号类：`whoami`、`balance`、`models`
+* 账号类：`whoami`、`balance`、`models`、`usage`、`requests`
 * 提交类：`package`、`upload`、`run`、`start`、`cancel`、`submit`
 * 跟踪类：`status`、`wait`、`logs`、`source`、`download`、`archive`
 
-`balance` 和 `models` 用网关 access key 登录 `meter.arc-bench.com`（取
-`ARC_BENCH_API_KEY`，没有就从 `/api/auth/access-key` 读账号自带的那把），**不再需要
+`balance`、`models`、`usage`、`requests` 都用网关 access key 登录 `meter.arc-bench.com`
+（取 `ARC_BENCH_API_KEY`，没有就从 `/api/auth/access-key` 读账号自带的那把），**不再需要
 浏览器 cookie**；设了 `ARC_BENCH_METER_COOKIE` 时以它为准。
+
+计量站会**忽略自己的 `granularity`、`since`、`limit` 三个查询参数**：`/api/user/usage` 永远
+返回完整的小时粒度历史，`/api/user/requests` 永远返回全部计费请求且从旧到新。所以按天合并、
+`--since`/`--model` 筛选、`requests --limit` 取最新 N 条，全部由客户端做；金额一律按十进制
+字符串相加，不走浮点。
 
 `run` 和 `submit` 的 `--task` 可以重复给多个，或者用 `--all-tasks` 跑完整个赛题的全部
 任务；`wait` 和 `status` 可以一次接多个 run id。
@@ -493,10 +523,16 @@ agent 用这个。
 本文早先写过两条硬规则——运行绝不能重叠、有运行 pending 时不要上传。**两条都不是平台约束，
 已经删掉。**
 
-**重叠唯一的真实代价**是官方 token 计数：它是共享 access key 上的计量差值，所以运行期间任何
-花在这把 key 上的 token——另一个运行，或者 agent 自己打的本地网关调用——都会记到这次运行头上。
-它只影响性价比榜（senior 档，通过率 ≥ 80%），对通过率毫无影响。**在乎那个成本数字时就串行，
-否则尽管并发。**
+**重叠真正毁掉的是成本那一列。** 官方 token 计数是共享 access key 上的计量差值，它分不清测到
+的是谁的流量。还是 2026-09-15 那一批：七个运行被打上了几乎相同的数字——运行日志里写着
+`Meter usage captured: tokens=29910448, cost=36.452976 CNY`——因为每个差值都横跨了全部七个运行。
+那是整批的总量，不是任何单个运行的量，而性价比榜（senior 档，通过率 ≥ 80%）读的正是它。通过率
+不受影响。**在乎成本数字时就串行，否则尽管并发，并且把成本列当成无意义。**
+
+**余额是硬上限，而且同样是共享的。** 同一批把账户打到 −1.35 CNY，之后网关直接返回 HTTP 402
+`insufficient_balance`，**每一个**运行都在生成阶段失败——上面那七个运行全部 FAILED 就是这个原因，
+跟 agent 本身无关。并发会成倍拉高烧钱速度，所以**开一批运行之前先跑 `arcbench balance`**，跑完
+用 `arcbench usage` 看钱花在哪。
 
 客户端的行为由此而来：
 
@@ -583,9 +619,10 @@ package  →  upload（校验哈希）  →  run  →  wait  →  status / logs 
 
 ### agent 绝对不能做的事
 
-* **在乎成本数字的运行旁边继续花这把 key 的 token。** 官方 token 计数是共享 access key 上的
-  计量差值，所以并发的另一个运行、或 agent 自己打的本地网关调用，都会被算进先跑那次的 token。
-  代价只有性价比榜这一项，所以量通过率时尽管并发，量 token 时才串行。
+* **不看余额就开一批运行。** 余额是共享的硬上限，一旦为负，网关返回 HTTP 402
+  `insufficient_balance`，在跑的运行全部在生成阶段失败。先跑 `arcbench balance`。
+* **相信并发运行的成本列。** 官方 token 计数是共享 key 上的计量差值，重叠的运行每个都被打上
+  整批的用量。代价只有性价比榜这一项，所以量通过率时尽管并发，量 token 时才串行。
 * **报错后盲目重试写请求。** `upload`、`run`、`start`、`cancel` 都是写。结果无法观测时，
   错误里会带 `outcome_uncertain` 并给出该查的 id；去读那个 id 的状态再决定，而不是重复
   调用。唯一存在的自动重试是 `run` 内部对容量不足的退避，且只针对同一个 run id。
@@ -625,7 +662,8 @@ $ arcbench --json leaderboard --competition ticket-booking --task ticket-booking
 ## 接口路由表
 
 见上文英文部分的表格，内容一致（计量服务另有 `POST /api/user/login`，用 access key 换 12 小时
-的 `onr_user_session` cookie，以及 `GET /api/user/models` 价格表）。另有两个已观测到的怪异之处，客户端是如实处理而不是
+的 `onr_user_session` cookie，以及 `GET /api/user/models` 价格表、`GET /api/user/usage` 用量、
+`GET /api/user/requests` 计费请求流水，后两者的查询参数服务端不认）。另有两个已观测到的怪异之处，客户端是如实处理而不是
 掩盖：费用字段名叫 `token_cost_usd`，但同时返回的 `token_cost_currency` 并不总是 USD，
 所以金额和币种永远一起输出；取消请求可能在**已经生效之后**返回 HTTP 500，所以 `cancel`
 会在之后再读一次运行状态，两者一并报告。

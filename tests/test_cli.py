@@ -26,6 +26,8 @@ COMMANDS = {
     "whoami",
     "balance",
     "models",
+    "usage",
+    "requests",
     "tasks",
     "competitions",
     "fetch",

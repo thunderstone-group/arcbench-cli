@@ -13,13 +13,20 @@ all past `deploy_agent`, none stranded, and every one reached a terminal state o
 its own. The leaderboard takes the most recent completed run per task, and a
 competition score is the highest average across every saved submission.
 
-The one real cost of overlap remains: the official token count is a usage-meter
-delta on the shared access key, so any traffic on that key during a run — another
-run, or a local gateway call — is added to that run's token and cost figures.
-That affects the cost-efficiency ranking (senior tier, pass rate ≥ 80%) and
-nothing else. The doctrine is now **serialize when the cost figure matters,
-otherwise run concurrently**, in the README (both languages), the agent skill and
-the code.
+Overlap costs two things, both now documented. **The cost column becomes
+meaningless**: the official token count is a usage-meter delta on the shared
+access key and cannot tell whose traffic it measured, so all seven runs in that
+batch were stamped with roughly the same figures — the run log reads `Meter usage
+captured: tokens=29910448, cost=36.452976 CNY` — each delta spanning the whole
+batch. Only the cost-efficiency ranking (senior tier, pass rate ≥ 80%) reads
+those; pass rate is unaffected. **And the balance is a shared hard ceiling**: the
+batch drove the account to −1.35 CNY, the gateway then returned HTTP 402
+`insufficient_balance`, and every run failed in generation — which is why all
+seven finished FAILED, for reasons that had nothing to do with the agents.
+
+The doctrine is now **concurrent runs are allowed, their cost columns are
+meaningless, and the balance is a hard ceiling — check `balance` before starting a
+batch**, in the README (both languages), the agent skill and the code.
 
 No code path had ever enforced the old rules, so nothing had to be unblocked.
 
@@ -59,6 +66,14 @@ hours; a wrong key returns HTTP 401 `{"error":"invalid access key"}`.
 * New `models` command prints the gateway's price table — id, provider,
   availability, input / cache-hit / output price and unit — with `--json` giving
   the raw list.
+* New `usage [--granularity hour|day] [--since ISO] [--model M]` prints metered
+  spend per bucket and model with a total line, and new `requests [--limit N]`
+  prints the newest billed gateway calls (time, model, tokens, amount, request id).
+  The meter ignores its own `granularity`, `since` and `limit` parameters —
+  `/api/user/usage` always answers with the full hourly history and
+  `/api/user/requests` with every request, oldest first — so the day merge, the
+  filters and the limit are applied client-side, and amounts are summed as
+  decimals rather than floats.
 * The access key and the session cookie are redacted in every log and error path,
   as every other credential already was.
 
@@ -73,10 +88,12 @@ hours; a wrong key returns HTTP 401 `{"error":"invalid access key"}`.
 
 ### Tests
 
-The suite grew from 76 checks to 90. The new ones cover the meter login flow
+The suite grew from 76 checks to 95. The new ones cover the meter login flow
 (success, a rejected key, the cookie override, and the account-key fallback),
 `models`, multi-task `run` including one failed start, `--all-tasks` resolution
-from a submission, and multi-id `wait` and `status` exit codes. The meter
+from a submission, multi-id `wait` and `status` exit codes, the `usage` day merge
+and its decimal arithmetic, the `--since` and `--model` selection, and the newest-
+first `requests` limit. The meter
 responses in `tests/fixtures/meter-responses.json` are the live service's own
 replies with the account identifiers removed. No test touches the network.
 

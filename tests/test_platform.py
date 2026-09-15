@@ -29,8 +29,11 @@ from arcbench_cli.client import (
     ApiError,
     OfficialClient,
     SubmitConfig,
+    aggregate_usage,
     log_summary,
+    summarize_request,
     summarize_run,
+    usage_total,
 )
 from arcbench_cli.cli import main
 
@@ -111,6 +114,13 @@ class Website:
                     result = METER["freshness"]
                 elif path == "/api/user/models":
                     result = METER["models"]
+                elif path.split("?")[0] == "/api/user/usage":
+                    # The live service ignores granularity and answers hourly.
+                    result = METER["usage"]
+                elif path.split("?")[0] == "/api/user/requests":
+                    # The live service ignores limit and returns everything,
+                    # oldest first.
+                    result = METER["requests"]
                 elif path == "/api/competitions/sample":
                     result = {
                         "id": "sample",
@@ -624,6 +634,66 @@ class PlatformTests(unittest.TestCase):
                              ["deepseek-v4-flash", "deepseek-v4-pro"])
             self.assertEqual(models[0]["pricing"]["unit"], "CNY / 1M tokens")
             self.assertEqual(server.requests[-1]["path"], "/api/user/models")
+
+    def test_usage_keeps_the_server_row_shape_and_totals_in_decimal(self) -> None:
+        with Website() as server:
+            code, output = self.run_cli(
+                server, "usage", env_lines=[f"ARC_BENCH_API_KEY={MODEL_KEY}"]
+            )
+            self.assertEqual(code, 0)
+            rows = json.loads(output)
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(rows[0]["dimensions"]["bucket"], "2026-09-14T03:00:00+00:00")
+            self.assertEqual(rows[0]["measures"]["amount"], "1.404476")
+            self.assertEqual(usage_total(rows)["amount"], "40.057251")
+            self.assertEqual(server.requests[-1]["path"], "/api/user/usage?granularity=hour")
+
+    def test_usage_day_merges_hour_buckets_the_service_will_not(self) -> None:
+        rows = aggregate_usage(METER["usage"]["rows"], "day")
+        self.assertEqual(
+            [(row["dimensions"]["bucket"], row["dimensions"]["model"]) for row in rows],
+            [
+                ("2026-09-14", "deepseek-v4-flash"),
+                ("2026-09-14", "kimi-k3"),
+                ("2026-09-15", "deepseek-v4-flash"),
+            ],
+        )
+        # 1.404476 + 3.202565, added as decimals rather than floats.
+        self.assertEqual(rows[0]["measures"]["amount"], "4.607041")
+        self.assertEqual(rows[0]["measures"]["prompt_tokens"], 125832 + 673118)
+        self.assertEqual(rows[0]["measures"]["usage_event_count"], 78)
+
+    def test_usage_since_and_model_select_client_side(self) -> None:
+        rows = METER["usage"]["rows"]
+        self.assertEqual(
+            [row["dimensions"]["model"] for row in aggregate_usage(rows, "hour", model="kimi-k3")],
+            ["kimi-k3"],
+        )
+        recent = aggregate_usage(rows, "hour", since="2026-09-15T00:00:00Z")
+        self.assertEqual(len(recent), 1)
+        self.assertEqual(recent[0]["measures"]["amount"], "35.183570")
+        self.assertEqual(aggregate_usage(rows, "hour", since="2030-01-01T00:00:00Z"), [])
+        self.assertEqual(usage_total([])["amount"], "0")
+
+    def test_requests_returns_the_newest_entries_first(self) -> None:
+        with Website() as server:
+            code, output = self.run_cli(
+                server, "requests", "--limit", "2", env_lines=[f"ARC_BENCH_API_KEY={MODEL_KEY}"]
+            )
+            self.assertEqual(code, 0)
+            entries = json.loads(output)
+            self.assertEqual(
+                [entry["request_id"] for entry in entries],
+                ["2026091510583767756231956632", "2026091411342407200837985435"],
+            )
+            self.assertEqual(server.requests[-1]["path"], "/api/user/requests?limit=2")
+
+    def test_request_summary_renders_epoch_seconds_as_utc(self) -> None:
+        summary = summarize_request(METER["requests"]["requests"][0])
+        self.assertEqual(summary["occurred_at"], "2026-09-14T03:16:53Z")
+        self.assertEqual(summary["model"], "kimi-k3")
+        self.assertEqual(summary["total_tokens"], 8721)
+        self.assertEqual(summary["amount"], "0.284180")
 
     def test_meter_identifier_is_not_printed_in_full(self) -> None:
         with Website() as server:
