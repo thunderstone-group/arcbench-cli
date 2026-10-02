@@ -23,6 +23,7 @@ from arcbench_cli.cli import (
 
 COMMANDS = {
     "session",
+    "selftest",
     "whoami",
     "balance",
     "models",
