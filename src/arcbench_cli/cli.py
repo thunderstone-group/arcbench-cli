@@ -307,6 +307,103 @@ def cmd_balance(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_env_file(args: argparse.Namespace) -> str:
+    """Find the env file that load_env would actually use, or describe the source."""
+    explicit = _env_file(args)
+    if explicit is not None:
+        # User passed --env-file or set ARCBENCH_ENV_FILE; load_env honors it
+        # verbatim and does NOT fall through to implicit candidates.
+        return str(explicit) if explicit.is_file() else "MISSING"
+    # No explicit path: replicate load_env(None) implicit lookup
+    candidates = [
+        os.environ.get("ARCBENCH_ENV_FILE"),
+        Path.cwd() / ".env",
+        Path.home() / ".config" / "arcbench" / ".env",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    # Credentials may come from ARC_BENCH_* environment variables alone
+    if any(k.startswith("ARC_BENCH_") for k in os.environ):
+        return "environment only"
+    return "MISSING"
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Run a quick environment self-check and report what is configured."""
+    checks: dict[str, Any] = {}
+    ok = True
+
+    # env file: report what load_env actually resolved
+    env_source = _resolve_env_file(args)
+    checks["env_file"] = env_source
+
+    # load env and config
+    env = load_env(_env_file(args))
+    config = SubmitConfig.from_env(env)
+
+    # cookie
+    if config.session_cookie:
+        checks["cookie"] = "present"
+    else:
+        checks["cookie"] = "MISSING"
+        ok = False
+
+    # whoami
+    if config.session_cookie:
+        try:
+            _, client = _client(args)
+            me = client.check_login()
+            checks["whoami"] = {
+                "http": 200,
+                "username": me.get("username") or me.get("account"),
+                "logged_in": me.get("logged_in"),
+            }
+            if not me.get("logged_in"):
+                ok = False
+        except Exception as e:
+            ok = False
+            checks["whoami"] = {"error": str(e)}
+    else:
+        checks["whoami"] = "skipped (no cookie)"
+
+    # dist zip (optional, only if --check-zip given)
+    check_zip = getattr(args, "check_zip", None)
+    if check_zip:
+        zip_path = Path(check_zip)
+        if zip_path.exists():
+            sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()[:8]
+            checks["dist_zip"] = {"bytes": zip_path.stat().st_size, "sha256_8": sha}
+        else:
+            checks["dist_zip"] = "MISSING"
+
+    # gateway key
+    if config.api_key:
+        checks["gateway_key"] = "present"
+        try:
+            _, meter_client = _meter_client(args)
+            bal = meter_client.balance()
+            checks["balance"] = {
+                "account": bal.get("account"),
+                "available": bal.get("available_balance"),
+                "currency": bal.get("currency"),
+            }
+        except Exception as e:
+            checks["balance"] = f"unavailable: {e}"
+    else:
+        checks["gateway_key"] = "MISSING"
+
+    record = {"ok": ok, "checks": checks}
+    lines = [f"doctor: ok={ok}"]
+    for key, value in checks.items():
+        if isinstance(value, dict):
+            lines.append(f"  {key}: {json.dumps(value, ensure_ascii=False)}")
+        else:
+            lines.append(f"  {key}: {value}")
+    emit(args, record, lines)
+    return 0 if ok else 2
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     """Print the gateway's price table, as the metering site publishes it."""
     _, client = _meter_client(args)
@@ -1030,6 +1127,9 @@ def build_parser() -> argparse.ArgumentParser:
     action.add_argument("--output", required=True)
 
     add("balance", "read the metering balance and billing freshness", cmd_balance)
+
+    command = add("doctor", "run a quick environment self-check", cmd_doctor)
+    command.add_argument("--check-zip", help="optional: check this ZIP archive (e.g. dist/agent.zip)")
 
     add("models", "list the gateway's models and their published prices", cmd_models)
 

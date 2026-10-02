@@ -26,6 +26,7 @@ COMMANDS = {
     "selftest",
     "whoami",
     "balance",
+    "doctor",
     "models",
     "usage",
     "requests",
@@ -289,6 +290,34 @@ class SubmitFlowTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(client.calls, ["check_login", "list_tasks"])
             self.assertEqual(list(Path(tmp).glob("*.json")), [])
+
+
+class DoctorCommandTests(unittest.TestCase):
+    def test_doctor_parser_accepts_no_arguments(self) -> None:
+        args = build_parser().parse_args(["doctor"])
+        self.assertEqual(args.func.__name__, "cmd_doctor")
+
+    def test_doctor_reports_missing_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                # Clear all ARC_BENCH_* env vars to ensure hermetic test, but keep HOME for Path.home()
+                kept_vars = {k: v for k, v in os.environ.items()
+                             if k in ("HOME", "USERPROFILE", "HOMEPATH", "HOMEDRIVE")}
+                with patch.dict(os.environ, kept_vars, clear=True):
+                    args = build_parser().parse_args(["doctor"])
+                    # Mock _client and _meter_client to fail if called
+                    with patch("arcbench_cli.cli._client") as mock_client, \
+                         patch("arcbench_cli.cli._meter_client") as mock_meter:
+                        code = args.func(args)
+                        # Fail if any HTTP request was made
+                        mock_client.assert_not_called()
+                        mock_meter.assert_not_called()
+                    self.assertEqual(code, 2)  # ok=False returns 2
+            finally:
+                os.chdir(old_cwd)
 
 
 if __name__ == "__main__":
