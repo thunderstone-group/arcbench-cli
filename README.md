@@ -117,7 +117,9 @@ accepts an already generated app, skips the agent run, and returns individual
 test errors and screenshots. Results **do not count on the leaderboard** and do
 not replace a competition submission. The service exposes GitHub Stages 1–3;
 read `selftest tasks` for the current list. Its published daily quota is 10,
-reset at 00:00 UTC; `selftest submissions` includes the account's actual quota.
+reset at 00:00 UTC. `selftest submissions` preserves the server's history and
+any quota field it supplies; the current endpoint omits quota, so the CLI does
+not claim an authoritative remaining allowance from that response.
 
 Sign in to the self-test website once with GitHub, then capture that site's
 separate session. This reads only its NextAuth session cookie (including cookie
