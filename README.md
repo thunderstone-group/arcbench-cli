@@ -129,6 +129,7 @@ Account:
 arcbench whoami
 arcbench whoami --meter                        # the metering service's own session
 arcbench balance                               # logs in with the gateway access key
+arcbench doctor                                # quick environment self-check
 arcbench models                                # the gateway's price table
 arcbench usage --granularity day               # metered spend per bucket and model
 arcbench usage --since 2026-09-15T00:00:00Z --model deepseek-v4-flash
@@ -209,7 +210,7 @@ up to six resumes, then an `incomplete_response` transport error with the byte c
 |---|---|
 | 0 | success; for `wait`, `status RUN_ID` and `submit`, every run PASSED |
 | 1 | a request failed, a run failed to start, or a run reached a non-passing terminal state |
-| 2 | the local waiting deadline expired, or the session is not logged in |
+| 2 | the local waiting deadline expired, the session is not logged in, or `doctor` found missing credentials |
 
 With several runs the codes reduce the same way: `1` if any run finished without
 passing, otherwise `2` if any was still going when the deadline expired. A `wait`
