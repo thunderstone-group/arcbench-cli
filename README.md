@@ -593,12 +593,15 @@ agent 用这个。
 命令、示例与退出码见上文英文部分，行为完全一致：
 
 * 查看类：`competitions`、`tasks`、`fetch`、`leaderboard`、`submissions`、`runs`
-* 账号类：`whoami`、`balance`、`models`、`usage`、`requests`
+* 账号类：`whoami`、`balance`、`doctor`、`models`、`usage`、`requests`
 * 提交类：`package`、`upload`、`run`、`start`、`cancel`、`submit`
 * 正式赛：`registration`（报名状态、是否队长、剩余比赛额度）、`requirements`（下载需求文档）、
   `upload --official-evaluation`（勾选「使用比赛额度评测」，平台自建 key 计费，不上传个人 key）。
   确认队伍只能在网页上由队长做，CLI 不代办。
 * 跟踪类：`status`、`wait`、`logs`、`source`、`download`、`archive`
+* 应用快速自测：`selftest session`、`tasks`、`submissions`、`submit`、`status`、`screenshot`。
+  使用主办方独立自测站的登录会话，上传已生成的应用并获取逐项结果，不计入正式榜单。
+  完整用法见 [Application self-tests](#application-self-tests)。
 
 `balance`、`models`、`usage`、`requests` 都用网关 access key 登录 `meter.arc-bench.com`
 （取 `ARC_BENCH_API_KEY`，没有就从 `/api/auth/access-key` 读账号自带的那把），**不再需要
