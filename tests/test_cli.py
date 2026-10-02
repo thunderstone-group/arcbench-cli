@@ -23,6 +23,7 @@ from arcbench_cli.cli import (
 
 COMMANDS = {
     "session",
+    "selftest",
     "whoami",
     "balance",
     "doctor",
@@ -305,7 +306,9 @@ class DoctorCommandTests(unittest.TestCase):
                 # Clear all ARC_BENCH_* env vars to ensure hermetic test, but keep HOME for Path.home()
                 kept_vars = {k: v for k, v in os.environ.items()
                              if k in ("HOME", "USERPROFILE", "HOMEPATH", "HOMEDRIVE")}
-                with patch.dict(os.environ, kept_vars, clear=True):
+                # Implicit config lookup must not read the developer's home config either.
+                with patch.dict(os.environ, kept_vars, clear=True), \
+                     patch("pathlib.Path.home", return_value=Path(tmp)):
                     args = build_parser().parse_args(["doctor"])
                     # Mock _client and _meter_client to fail if called
                     with patch("arcbench_cli.cli._client") as mock_client, \

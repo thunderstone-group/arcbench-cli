@@ -5,9 +5,9 @@ the same HTTP API the website's own front end calls: discover competitions,
 download official test packs, upload an agent, start and watch runs, and read
 logs, source files and leaderboards.
 
-It is a **pure HTTP client**. Exactly one command, `arcbench session`, touches
-the browser, and only once per login, to read the cookie the platform already
-gave you. Everything after that is `urllib` against `https://arc-bench.com/api`.
+It is a **pure HTTP client**. The `session` commands touch the browser once per
+login to read the cookie the selected service already gave you. Everything
+after that uses `urllib` against the service's HTTP API.
 
 * No third-party runtime dependencies. Python 3.10+ and the standard library.
 * No browser automation, no driver, no headless Chrome.
@@ -109,6 +109,63 @@ and disables logging without changing the command outcome.
 and cause types and, when available, errno. Logging does not add retries or
 change exit codes. A malformed balance response now fails explicitly instead
 of reporting a null balance.
+
+## Application self-tests
+
+The organizer's [self-test service](https://arcbench-selftest-web.vercel.app)
+accepts an already generated app, skips the agent run, and returns individual
+test errors and screenshots. Results **do not count on the leaderboard** and do
+not replace a competition submission. The service exposes GitHub Stages 1–3;
+read `selftest tasks` for the current list. Its published daily quota is 10,
+reset at 00:00 UTC. `selftest submissions` preserves the server's history and
+any quota field it supplies; the current endpoint omits quota, so the CLI does
+not claim an authoritative remaining allowance from that response.
+
+Sign in to the self-test website once with GitHub, then capture that site's
+separate session. This reads only its NextAuth session cookie (including cookie
+chunks), never the GitHub login cookie or competition credentials:
+
+```sh
+arcbench --env-file ~/.config/arcbench/team.env selftest session --profile Default
+arcbench --env-file ~/.config/arcbench/team.env selftest tasks --json
+arcbench --env-file ~/.config/arcbench/team.env selftest submissions --json
+arcbench --env-file ~/.config/arcbench/team.env selftest submit app.zip \
+  --task github-stage-1-req-test --wait --output selftest-result.json --json
+arcbench --env-file ~/.config/arcbench/team.env selftest status SUBMISSION_ID \
+  --wait --output recovered-result.json --json
+arcbench --env-file ~/.config/arcbench/team.env selftest screenshot SUBMISSION_ID \
+  --path 'output/.../test-failed-1.png' --output failure.png
+```
+
+`app.zip` must contain a nonempty root `Dockerfile`, be at most 50 MB, and
+exclude `.git`, `node_modules`, and build outputs. The container must honor the
+`PORT` environment variable. This is an **application archive**, separate from
+the agent archive accepted by `arcbench upload`.
+
+Set `ARC_BENCH_SELFTEST_COOKIE` in the private env file on other systems, or use
+`selftest session --cookie-stdin` to read the Cookie header from stdin without
+putting it in arguments or command output. The Chrome capture command requires
+macOS. `ARC_BENCH_SELFTEST_BASE_URL` (or `--base-url` on a self-test command)
+overrides the self-test origin; the main platform base URL is not reused.
+
+Uploading follows the web client's three-step protocol: allocate with
+`POST /api/upload-url` (`taskId`, `size`), PUT the ZIP to the signed upload URL,
+then `POST /api/submit` (`uploadId`). The object upload uses a separate HTTP
+opener with no account cookies and no redirects. Signed URLs are not recorded.
+Writes are never retried automatically. An uncertain failure retains its
+`upload_id`; check `selftest submissions` before retrying. `--output` saves an
+allocation checkpoint and the submission receipt before waiting, so polling
+can resume using the same id without another upload or quota charge.
+
+`selftest status` reads `GET /api/submissions/ID` and preserves every returned
+test title, error, and screenshot path. `--wait` polls only that id. Exit codes
+are 0 for a successful request or all tests passed, 1 for a terminal nonpassing
+result/error, and 2 for a local polling timeout; a timeout does not change the
+remote run's state. `submit --wait --json` emits the receipt and final result
+as two JSON lines. Polling tolerates two consecutive transport/5xx read failures,
+then re-raises; authentication failures are immediate. This retries only GET
+for the existing id, never an upload or submission. These contracts were checked against the deployed website
+on 2026-10-02; the test fixture is a sanitized real 10/30 response.
 
 ## Commands
 
@@ -536,12 +593,15 @@ agent 用这个。
 命令、示例与退出码见上文英文部分，行为完全一致：
 
 * 查看类：`competitions`、`tasks`、`fetch`、`leaderboard`、`submissions`、`runs`
-* 账号类：`whoami`、`balance`、`models`、`usage`、`requests`
+* 账号类：`whoami`、`balance`、`doctor`、`models`、`usage`、`requests`
 * 提交类：`package`、`upload`、`run`、`start`、`cancel`、`submit`
 * 正式赛：`registration`（报名状态、是否队长、剩余比赛额度）、`requirements`（下载需求文档）、
   `upload --official-evaluation`（勾选「使用比赛额度评测」，平台自建 key 计费，不上传个人 key）。
   确认队伍只能在网页上由队长做，CLI 不代办。
 * 跟踪类：`status`、`wait`、`logs`、`source`、`download`、`archive`
+* 应用快速自测：`selftest session`、`tasks`、`submissions`、`submit`、`status`、`screenshot`。
+  使用主办方独立自测站的登录会话，上传已生成的应用并获取逐项结果，不计入正式榜单。
+  完整用法见 [Application self-tests](#application-self-tests)。
 
 `balance`、`models`、`usage`、`requests` 都用网关 access key 登录 `meter.arc-bench.com`
 （取 `ARC_BENCH_API_KEY`，没有就从 `/api/auth/access-key` 读账号自带的那把），**不再需要

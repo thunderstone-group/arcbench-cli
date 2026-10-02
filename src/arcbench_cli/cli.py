@@ -1,8 +1,8 @@
 """Command-line interface for ARC-Bench.
 
-One command surface over one credential model. Every command but ``session``
-is plain HTTP against the platform API; ``session`` reads the browser cookie
-store once per login.
+One command surface for the competition and application self-test services.
+Only the ``session`` commands read the browser cookie store, once per login;
+subsequent operations use plain HTTP and keep each service's login separate.
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ from .client import (
     write_record,
 )
 from .session import capture_chrome_cookie, default_env_path
+from .selftest import COOKIE_VARIABLE, SelftestClient, result_exit, validate_app
+from .session import capture_selftest_cookie
 from .diagnostics import Diagnostics, active as active_diagnostics, failure_kind
 
 PACKAGE_EXCLUDED = {"node_modules", ".git", "dist", "__pycache__", ".venv", ".pytest_cache"}
@@ -190,6 +192,79 @@ def _resolve_tasks(
     if not resolved:
         raise CliError("choose what to run: --task TASK (repeatable) or --all-tasks")
     return list(dict.fromkeys(resolved))
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """Application-only self-tests use a separate account session and API."""
+    if args.action == "session":
+        env_path = _env_file(args) or default_env_path()
+        if args.cookie_stdin:
+            from .session import write_env_cookie
+            header = sys.stdin.read().strip()
+            if not header or "\n" in header or "\r" in header or "=" not in header:
+                raise CliError("stdin must contain one nonempty Cookie header, without line breaks")
+            written = write_env_cookie(env_path, header, COOKIE_VARIABLE)
+        else:
+            written = capture_selftest_cookie(args.profile, env_path)
+        log(f"wrote {COOKIE_VARIABLE} to {written} (mode 600); value not printed")
+        return 0
+
+    # Validate local arguments before allocating an upload or consuming quota.
+    output = _new_file(Path(args.output)) if getattr(args, "output", None) else None
+    if args.action == "submit":
+        validate_app(Path(args.package))
+    if getattr(args, "wait", False) and (args.poll_interval <= 0 or args.poll_timeout < 0):
+        raise CliError("poll interval must be positive and timeout nonnegative")
+    client = SelftestClient.from_env(load_env(_env_file(args)), args.base_url)
+    if not client.config.session_cookie:
+        raise CliError(f"{COOKIE_VARIABLE} is not configured; run `arcbench selftest session`")
+
+    def save(record):
+        record = client.safe(record)
+        if output:
+            write_record(output, record, tuple(client.known_secrets))
+        return record
+
+    if args.action in {"tasks", "submissions"}:
+        record = getattr(client, args.action)()
+        emit(args, save(record))
+        return 0
+    if args.action == "screenshot":
+        assert output is not None
+        data = client.screenshot(args.submission, args.path)
+        output.write_bytes(data)
+        emit(args, {"path": str(output), "bytes": len(data)})
+        return 0
+    if args.action == "submit":
+        def allocated(record):
+            log(f"self-test upload allocated: {record['upload_id']}")
+            save({"record_type": "selftest", "counts_on_leaderboard": False, **record})
+
+        receipt = client.upload_application(args.task, Path(args.package), on_progress=allocated)
+        emit(args, save(receipt))
+        if not args.wait:
+            return 0
+        submission_id = receipt["id"]
+    else:
+        submission_id = args.submission
+    if args.wait:
+        last_status = None
+
+        def progress(record):
+            nonlocal last_status
+            if record.get("status") != last_status:
+                last_status = record.get("status")
+                log(f"self-test {submission_id}: {last_status}")
+
+        record = client.wait_submission(submission_id, args.poll_interval, args.poll_timeout, progress)
+    else:
+        record = client.submission(submission_id)
+    result = record.get("result") or {}
+    safe_record = save({"record_type": "selftest", "counts_on_leaderboard": False, **record})
+    emit(args, safe_record, [f"{submission_id}: {record.get('status')} "
+                             f"{result.get('passed', '?')}/{result.get('total', '?')}",
+                             json.dumps(safe_record, ensure_ascii=False)])
+    return result_exit(record)
 
 
 # --- credentials ---------------------------------------------------------
@@ -1026,6 +1101,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     command = add("whoami", "check the configured session", cmd_whoami)
     command.add_argument("--meter", action="store_true", help="check the metering session instead")
+
+    command = add("selftest", "upload an app and inspect organizer self-tests (not leaderboard scores)", cmd_selftest)
+    actions = command.add_subparsers(dest="action", required=True)
+    session = actions.add_parser("session", parents=[shared], help="save the separate self-test login")
+    source = session.add_mutually_exclusive_group()
+    source.add_argument("--profile", default="Default", help="macOS Chrome profile directory name")
+    source.add_argument("--cookie-stdin", action="store_true", help="read a Cookie header from stdin instead")
+    for name in ("tasks", "submissions"):
+        actions.add_parser(name, parents=[shared])
+    for name in ("submit", "status"):
+        action = actions.add_parser(name, parents=[shared])
+        if name == "submit":
+            action.add_argument("package", help="application ZIP with a root Dockerfile")
+            action.add_argument("--task", required=True)
+        else:
+            action.add_argument("submission")
+        action.add_argument("--wait", action="store_true", help="poll this same submission to completion")
+        action.add_argument("--poll-interval", type=float, default=20)
+        action.add_argument("--poll-timeout", type=float, default=1800)
+        action.add_argument("--output", help="save a private JSON result/checkpoint file")
+    action = actions.add_parser("screenshot", parents=[shared])
+    action.add_argument("submission")
+    action.add_argument("--path", required=True, help="screenshot path returned in a test result")
+    action.add_argument("--output", required=True)
 
     add("balance", "read the metering balance and billing freshness", cmd_balance)
 

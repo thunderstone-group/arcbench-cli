@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -64,7 +65,8 @@ def _safe_storage_key() -> bytes:
     )
 
 
-def read_chrome_cookies(profile: str = "Default", chrome_root: Path = DEFAULT_CHROME_ROOT) -> dict[str, str]:
+def read_chrome_cookies(profile: str = "Default", chrome_root: Path = DEFAULT_CHROME_ROOT,
+                        *, selftest: bool = False) -> dict[str, str]:
     """Return the ARC-Bench cookies held by a local Chrome profile."""
     if platform.system() != "Darwin":
         raise RuntimeError(
@@ -82,15 +84,27 @@ def read_chrome_cookies(profile: str = "Default", chrome_root: Path = DEFAULT_CH
         shutil.copy2(source, copy)
         connection = sqlite3.connect(f"file:{copy}?immutable=1", uri=True)
         try:
-            rows = connection.execute(
-                "select name, encrypted_value from cookies "
-                "where host_key like '%arc-bench%' and name in (?, ?)",
-                (SESSION_COOKIE, STICKY_COOKIE),
-            ).fetchall()
+            if selftest:
+                rows = connection.execute(
+                    "select name, encrypted_value from cookies where host_key in (?, ?) "
+                    "and (name = ? or name like ?)",
+                    ("arcbench-selftest-web.vercel.app", ".arcbench-selftest-web.vercel.app",
+                     "__Secure-next-auth.session-token", "__Secure-next-auth.session-token.%"),
+                ).fetchall()
+                rows = [(name, value) for name, value in rows if re.fullmatch(
+                    r"__Secure-next-auth\.session-token(?:\.\d+)?", name)]
+            else:
+                rows = connection.execute(
+                    "select name, encrypted_value from cookies "
+                    "where host_key like '%arc-bench%' and name in (?, ?)",
+                    (SESSION_COOKIE, STICKY_COOKIE),
+                ).fetchall()
         finally:
             connection.close()
 
     if not rows:
+        if selftest:
+            raise RuntimeError("no self-test session; sign in at https://arcbench-selftest-web.vercel.app first")
         raise RuntimeError("no ARC-Bench cookies; sign in at https://arc-bench.com/login first")
 
     found: dict[str, str] = {}
@@ -99,7 +113,7 @@ def read_chrome_cookies(profile: str = "Default", chrome_root: Path = DEFAULT_CH
         if blob[:3] != b"v10":
             raise RuntimeError(f"{name}: unexpected encryption prefix {blob[:3]!r}")
         found[name] = cookie_plaintext(strip_pkcs7(decrypt_cbc(blob[3:], key, COOKIE_IV)))
-    if SESSION_COOKIE not in found:
+    if not selftest and SESSION_COOKIE not in found:
         raise RuntimeError(f"{SESSION_COOKIE} missing from the cookie store")
     return found
 
@@ -132,3 +146,9 @@ def capture_chrome_cookie(
     cookies = read_chrome_cookies(profile, chrome_root)
     written = write_env_cookie(env_path or default_env_path(), format_cookie_header(cookies))
     return written, len(cookies[SESSION_COOKIE])
+
+
+def capture_selftest_cookie(profile: str, env_path: Path) -> Path:
+    cookies = read_chrome_cookies(profile, selftest=True)
+    header = "; ".join(f"{name}={value}" for name, value in sorted(cookies.items()))
+    return write_env_cookie(env_path, header, "ARC_BENCH_SELFTEST_COOKIE")
