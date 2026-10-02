@@ -75,6 +75,34 @@ class SelftestTests(unittest.TestCase):
         self.assertEqual(result["result"]["total"], 30)
         self.assertEqual([call.args for call in status.call_args_list], [("fixture-submission",)] * 2)
 
+    def test_read_tls_failure_is_retried_without_another_upload(self):
+        # Observed on 2026-10-02 after the service accepted an upload: GET status
+        # returned URLError/SSLEOFError with transport_failure=true, not a verdict.
+        failure = ApiError("TLS unexpected EOF", transport=True, method="GET", kind="tls")
+        with patch.object(self.client, "submission", side_effect=[failure, FIXTURE["submission"]]) as status, \
+                patch.object(self.client, "upload_application") as upload, \
+                patch("arcbench_cli.selftest.time.sleep"):
+            result = self.client.wait_submission("fixture-submission")
+        self.assertEqual(result["result"]["passed"], 10)
+        self.assertEqual(status.call_count, 2)
+        upload.assert_not_called()
+
+    def test_repeated_read_failure_is_bounded_and_auth_failure_is_not_retried(self):
+        for error, expected_calls in ((ApiError("TLS EOF", transport=True), 3),
+                                       (ApiError("sign in required", status=401), 1)):
+            with self.subTest(error=str(error)), patch.object(self.client, "submission", side_effect=error) as status, \
+                    patch("arcbench_cli.selftest.time.sleep"):
+                with self.assertRaises(ApiError):
+                    self.client.wait_submission("fixture-submission")
+            self.assertEqual(status.call_count, expected_calls)
+
+    def test_read_failure_at_deadline_remains_a_local_timeout(self):
+        with patch.object(self.client, "submission", side_effect=ApiError("TLS EOF", transport=True)):
+            result = self.client.wait_submission("fixture-submission", timeout=0)
+        self.assertTrue(result["poll_timed_out"])
+        self.assertIsNone(result["status"])
+        self.assertEqual(result_exit(result), 2)
+
     def test_upload_follows_live_web_protocol_without_forwarding_cookies(self):
         signed = "https://storage.example.test/app.zip?signature=private-signature"
         response = Mock(status=200)

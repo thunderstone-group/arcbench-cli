@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .client import ApiError, OfficialClient, SubmitConfig, sha256_file
+from .client import ApiError, DEFAULT_POLL_TOLERANCE, OfficialClient, SubmitConfig, sha256_file
 
 BASE_URL = "https://arcbench-selftest-web.vercel.app"
 COOKIE_VARIABLE = "ARC_BENCH_SELFTEST_COOKIE"
@@ -136,8 +136,22 @@ class SelftestClient(OfficialClient):
         if interval <= 0 or timeout < 0:
             raise ValueError("poll interval must be positive and timeout nonnegative")
         deadline = time.monotonic() + timeout
+        failures = 0
+        last = {"id": submission_id, "status": None}
         while True:
-            record = self.submission(submission_id)
+            try:
+                record = self.submission(submission_id)
+            except ApiError as error:
+                failures += 1
+                if failures > DEFAULT_POLL_TOLERANCE or not (error.transport or (error.status or 0) >= 500):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return dict(last, poll_timed_out=True, poll_error=self.safe(error.details))
+                time.sleep(min(interval, remaining))
+                continue
+            failures = 0
+            last = record
             if on_progress:
                 on_progress(record)
             status = str(record.get("status", "")).lower()

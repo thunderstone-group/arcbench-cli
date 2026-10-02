@@ -162,7 +162,9 @@ test title, error, and screenshot path. `--wait` polls only that id. Exit codes
 are 0 for a successful request or all tests passed, 1 for a terminal nonpassing
 result/error, and 2 for a local polling timeout; a timeout does not change the
 remote run's state. `submit --wait --json` emits the receipt and final result
-as two JSON lines. These contracts were checked against the deployed website
+as two JSON lines. Polling tolerates two consecutive transport/5xx read failures,
+then re-raises; authentication failures are immediate. This retries only GET
+for the existing id, never an upload or submission. These contracts were checked against the deployed website
 on 2026-10-02; the test fixture is a sanitized real 10/30 response.
 
 ## Commands
